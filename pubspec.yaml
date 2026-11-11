@@ -1,0 +1,43 @@
+name: t_roadster
+description: "T Roadster - a 3D endless-runner stunt driver. White angular pickup, coastal sunset highway, barrel rolls and front flips. Built to match the Highway Roadster reel."
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # Pinned exactly: the version this code was written and reviewed against.
+  flame: 1.20.0
+  shared_preferences: ^2.3.0
+  audioplayers: ^6.0.0
+  sensors_plus: ^6.0.0
+  # Round 9: save the share card PNG on the device (no sharing SDK).
+  path_provider: ^2.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/logo.png
+    - assets/sounds/
+  fonts:
+    - family: RussoOne
+      fonts:
+        - asset: assets/fonts/RussoOne-Regular.ttf
+    - family: ArchivoBlack
+      fonts:
+        - asset: assets/fonts/ArchivoBlack-Regular.ttf
+    - family: Nunito
+      fonts:
+        - asset: assets/fonts/Nunito-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/Nunito-Regular.ttf
+          weight: 700
