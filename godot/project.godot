@@ -1,0 +1,30 @@
+; Engine configuration file.
+; https://docs.godotengine.org/en/stable/tutorials/getting_started/step_by_step/project_settings.html
+
+config_version=5
+
+[application]
+
+config/name="T Roadster"
+config/description="Real-3D endless-runner stunt driver — white angular pickup on a coastal highway at sunset."
+run/main_scene="res://main.tscn"
+config/features=PackedStringArray("4.3", "Mobile")
+config/icon="res://assets/logo.png"
+
+[display]
+
+window/size/viewport_width=1080
+window/size/viewport_height=1920
+window/size/resizable=false
+window/handheld/orientation=1
+
+[input_devices]
+
+pointing/emulate_touch_from_mouse=true
+
+[rendering]
+
+renderer/rendering_method="mobile"
+renderer/rendering_method.mobile="gl_compatibility"
+textures/vram_compression/import_etc2_astc=true
+environment/defaults/default_clear_color=Color(0.09, 0.05, 0.16, 1)
