@@ -1,0 +1,83 @@
+# T Roadster (Godot 4.3) — Android APK build
+# Proves the exact steps on every push to main. Mirrors the locally verified
+# pipeline: Godot 4.3-stable + export templates + Temurin JDK 17 + Android SDK
+# (platform-tools, android-34, build-tools 34.0.0). No Gradle build is used
+# (gradle_build/use_gradle_build=false in export_presets.cfg) — Godot exports
+# with the prebuilt template APK and the workflow signs it with apksigner.
+name: Build Godot APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'godot/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: godot
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Download Godot 4.3
+        run: |
+          curl -sL -o godot.zip https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_linux.x86_64.zip
+          unzip -q godot.zip
+          chmod +x Godot_v4.3-stable_linux.x86_64
+          ./Godot_v4.3-stable_linux.x86_64 --version
+
+      - name: Install Godot export templates
+        run: |
+          mkdir -p ~/.local/share/godot/export_templates/4.3.stable
+          curl -sL -o templates.tpz https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_export_templates.tpz
+          unzip -q templates.tpz -d ~/.local/share/godot/export_templates/4.3.stable
+          # The archive has a templates/ subfolder; Godot wants the files one level up.
+          mv ~/.local/share/godot/export_templates/4.3.stable/templates/* ~/.local/share/godot/export_templates/4.3.stable/
+          ls ~/.local/share/godot/export_templates/4.3.stable/ | head
+
+      - name: Import project
+        run: ./Godot_v4.3-stable_linux.x86_64 --headless --path . --import
+
+      - name: Point Godot at the Android SDK and JDK
+        # Godot reads these from editor_settings-4.3.tres (created by the
+        # import step above); the .cfg file is ignored in 4.3.
+        run: |
+          sed -i 's|^export/android/android_sdk_path = ""|export/android/android_sdk_path = "'"$ANDROID_HOME"'"|; s|^export/android/java_sdk_path = ""|export/android/java_sdk_path = "'"$JAVA_HOME"'"|' ~/.config/godot/editor_settings-4.3.tres
+          grep "export/android/.*sdk_path" ~/.config/godot/editor_settings-4.3.tres
+
+      - name: Export Android APK
+        run: |
+          ./Godot_v4.3-stable_linux.x86_64 --headless --path . --export-release "Android" build/t-roadster-godot.apk
+          ls -la build/
+
+      - name: Generate debug keystore and sign APK
+        run: |
+          keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          APKSIGNER="$ANDROID_HOME/build-tools/34.0.0/apksigner"
+          "$APKSIGNER" sign --ks debug.keystore --ks-key-alias androiddebugkey --ks-pass pass:android --key-pass pass:android build/t-roadster-godot.apk
+          "$APKSIGNER" verify build/t-roadster-godot.apk
+          sha256sum build/t-roadster-godot.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: t-roadster-godot-apk
+          path: godot/build/t-roadster-godot.apk
+          if-no-files-found: error
