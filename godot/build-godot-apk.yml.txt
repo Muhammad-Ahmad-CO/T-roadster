@@ -78,7 +78,10 @@ jobs:
           grep "export/android/.*sdk_path" ~/.config/godot/editor_settings-4.3.tres
 
       - name: Export Android APK
+        # Godot does not create the output folder: a fresh checkout has no
+        # build/ dir, so the export fails ("Target folder does not exist").
         run: |
+          mkdir -p build
           ./Godot_v4.3-stable_linux.x86_64 --headless --path . --export-release "Android" build/t-roadster-godot.apk
           ls -la build/
 
