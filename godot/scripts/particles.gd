@@ -4,6 +4,34 @@ extends Node3D
 ## fires it once at a world position, and frees it when done — callers never
 ## manage particle lifetimes. The exhaust emitter is the exception: it loops
 ## while attached to the hero and is stopped by its owner.
+##
+## All emitters share ONE soft radial texture (built once, cached below) on
+## per-emitter materials: the texture gives every puff a round falloff, the
+## per-emitter material keeps each emitter's own colour. Without the texture
+## + TRANSPARENCY_ALPHA the quads render as hard opaque white squares.
+
+# Shared soft radial texture, built once on first use. Colours live on the
+# per-emitter materials, never in this texture (it is pure white + alpha).
+static var _radial_texture: ImageTexture = null
+
+static func _shared_radial_texture() -> ImageTexture:
+	if _radial_texture == null:
+		_radial_texture = _make_radial_texture(64)
+	return _radial_texture
+
+static func _make_radial_texture(size: int) -> ImageTexture:
+	# Soft radial falloff: opaque centre, transparent edges — same pattern
+	# as Vehicles._make_glow_texture (the hero underglow texture).
+	var img := Image.create(size, size, false, Image.FORMAT_RGBA8)
+	var half := float(size) * 0.5
+	for y in range(size):
+		for x in range(size):
+			var dx := (float(x) - half) / half
+			var dy := (float(y) - half) / half
+			var d: float = clampf(sqrt(dx * dx + dy * dy), 0.0, 1.0)
+			var t := pow(1.0 - d, 1.8)
+			img.set_pixel(x, y, Color(1.0, 1.0, 1.0, t))
+	return ImageTexture.create_from_image(img)
 
 static func _make(parent: Node, pos: Vector3, amount: int, lifetime: float, explosiveness: float = 0.9) -> GPUParticles3D:
 	var p := GPUParticles3D.new()
@@ -35,6 +63,8 @@ static func _quad_mesh(color: Color) -> QuadMesh:
 	q.size = Vector2(0.35, 0.35)
 	var mat := StandardMaterial3D.new()
 	mat.albedo_color = color
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.albedo_texture = _shared_radial_texture()
 	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	mat.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
 	q.material = mat

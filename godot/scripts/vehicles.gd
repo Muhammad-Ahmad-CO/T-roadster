@@ -8,7 +8,43 @@ class_name Vehicles extends RefCounted
 
 # ---------------------------------------------------------------- helpers
 
+# Per-invocation caches (Lane A rebuild): _std/_box/_cyl/_prism/_sphere
+# share mesh/material resources WITHIN one builder call only. Every
+# public builder calls _cache_begin() on entry and _cache_end() before
+# returning, so nothing is ever shared across instances — two heroes /
+# two traffic cars always get distinct resources. Brake, indicator and
+# paint materials are ALWAYS per-instance: brake/indicator parts use
+# _std_fresh() + _box_uniq(), which bypass both caches entirely, because
+# set_brake_lights/set_indicator mutate the mesh's surface material (a
+# shared material would light every car, or both indicator sides).
+static var _mat_cache: Dictionary = {}
+static var _mesh_cache: Dictionary = {}
+# Global (cross-instance) shares — allowed ONLY where nothing ever
+# mutates the resource: the glow texture and the 5 palm materials.
+static var _glow_tex_cache: Dictionary = {}
+static var _palm_trunk_mat: StandardMaterial3D = null
+static var _palm_leaf_mat: StandardMaterial3D = null
+static var _palm_leaf_mat2: StandardMaterial3D = null
+static var _palm_leaf_mat3: StandardMaterial3D = null
+static var _palm_nut_mat: StandardMaterial3D = null
+
+static func _cache_begin() -> void:
+	_mat_cache.clear()
+	_mesh_cache.clear()
+
+static func _cache_end() -> void:
+	_mat_cache.clear()
+	_mesh_cache.clear()
+
 static func _std(albedo: Color, metallic: float, roughness: float, emission: Color = Color(0, 0, 0), emission_energy: float = 0.0) -> StandardMaterial3D:
+	var key: Array = [albedo.r, albedo.g, albedo.b, albedo.a, metallic, roughness, emission.r, emission.g, emission.b, emission_energy]
+	if _mat_cache.has(key):
+		return _mat_cache[key] as StandardMaterial3D
+	var m := _std_fresh(albedo, metallic, roughness, emission, emission_energy)
+	_mat_cache[key] = m
+	return m
+
+static func _std_fresh(albedo: Color, metallic: float, roughness: float, emission: Color = Color(0, 0, 0), emission_energy: float = 0.0) -> StandardMaterial3D:
 	var m := StandardMaterial3D.new()
 	m.albedo_color = albedo
 	m.metallic = metallic
@@ -19,7 +55,86 @@ static func _std(albedo: Color, metallic: float, roughness: float, emission: Col
 		m.emission_energy_multiplier = emission_energy
 	return m
 
+# Merged-mesh baking: append a primitive's surface-0 arrays through a
+# rigid transform into per-surface arrays, then build one ArrayMesh.
+# Tangents are dropped (no normal-mapped materials in this file); the
+# vertex/normal/uv/index sets are identical to the source primitives,
+# so merged geometry rasterizes exactly like the separate parts.
+static func _surf_new() -> Dictionary:
+	return {"v": PackedVector3Array(), "n": PackedVector3Array(), "uv": PackedVector2Array(), "i": PackedInt32Array()}
+
+static func _bake_append(surf: Dictionary, prim: Mesh, xform: Transform3D) -> void:
+	var arr: Array = prim.surface_get_arrays(0)
+	var verts: PackedVector3Array = arr[Mesh.ARRAY_VERTEX]
+	var normals: PackedVector3Array = arr[Mesh.ARRAY_NORMAL]
+	var uvs: PackedVector2Array = arr[Mesh.ARRAY_TEX_UV]
+	var idx: PackedInt32Array = arr[Mesh.ARRAY_INDEX]
+	var v: PackedVector3Array = surf["v"]
+	var n: PackedVector3Array = surf["n"]
+	var uv: PackedVector2Array = surf["uv"]
+	var ii: PackedInt32Array = surf["i"]
+	var base: int = v.size()
+	var basis: Basis = xform.basis
+	for k in range(verts.size()):
+		v.append(xform * verts[k])
+		if normals.size() == verts.size():
+			n.append((basis * normals[k]).normalized())
+		else:
+			n.append(Vector3.UP)
+		if uvs.size() == verts.size():
+			uv.append(uvs[k])
+		else:
+			uv.append(Vector2.ZERO)
+	if idx.size() > 0:
+		for k in range(idx.size()):
+			ii.append(idx[k] + base)
+	else:
+		for k in range(verts.size()):
+			ii.append(k + base)
+	surf["v"] = v
+	surf["n"] = n
+	surf["uv"] = uv
+	surf["i"] = ii
+
+static func _merged_mesh(surfs: Array, mats: Array) -> ArrayMesh:
+	var mesh := ArrayMesh.new()
+	var added := 0
+	for si in range(surfs.size()):
+		var surf: Dictionary = surfs[si]
+		var verts: PackedVector3Array = surf["v"]
+		if verts.is_empty():
+			continue
+		var arrays: Array = []
+		arrays.resize(Mesh.ARRAY_MAX)
+		arrays[Mesh.ARRAY_VERTEX] = verts
+		arrays[Mesh.ARRAY_NORMAL] = surf["n"]
+		arrays[Mesh.ARRAY_TEX_UV] = surf["uv"]
+		arrays[Mesh.ARRAY_INDEX] = surf["i"]
+		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+		mesh.surface_set_material(added, mats[si] as Material)
+		added += 1
+	return mesh
+
 static func _box(size: Vector3, pos: Vector3, mat: Material) -> MeshInstance3D:
+	var key: Array = ["box", size.x, size.y, size.z, mat.get_instance_id()]
+	var mesh: BoxMesh = null
+	if _mesh_cache.has(key):
+		mesh = _mesh_cache[key] as BoxMesh
+	else:
+		mesh = BoxMesh.new()
+		mesh.size = size
+		mesh.material = mat
+		_mesh_cache[key] = mesh
+	var mi := MeshInstance3D.new()
+	mi.mesh = mesh
+	mi.position = pos
+	return mi
+
+static func _box_uniq(size: Vector3, pos: Vector3, mat: Material) -> MeshInstance3D:
+	# Cache bypass for brake/indicator parts: a FRESH mesh + the
+	# caller's own (fresh) material, so set_brake_lights/set_indicator
+	# can mutate this part's surface material without touching any
+	# other part, car, or side.
 	var mi := MeshInstance3D.new()
 	var mesh := BoxMesh.new()
 	mesh.size = size
@@ -29,55 +144,163 @@ static func _box(size: Vector3, pos: Vector3, mat: Material) -> MeshInstance3D:
 	return mi
 
 static func _cyl(top_r: float, bottom_r: float, height: float, pos: Vector3, mat: Material, segments: int = 10) -> MeshInstance3D:
+	var key: Array = ["cyl", top_r, bottom_r, height, segments, mat.get_instance_id()]
+	var mesh: CylinderMesh = null
+	if _mesh_cache.has(key):
+		mesh = _mesh_cache[key] as CylinderMesh
+	else:
+		mesh = CylinderMesh.new()
+		mesh.top_radius = top_r
+		mesh.bottom_radius = bottom_r
+		mesh.height = height
+		mesh.radial_segments = segments
+		mesh.material = mat
+		_mesh_cache[key] = mesh
 	var mi := MeshInstance3D.new()
-	var mesh := CylinderMesh.new()
-	mesh.top_radius = top_r
-	mesh.bottom_radius = bottom_r
-	mesh.height = height
-	mesh.radial_segments = segments
-	mesh.material = mat
 	mi.mesh = mesh
 	mi.position = pos
 	return mi
 
 static func _prism(size: Vector3, pos: Vector3, mat: Material) -> MeshInstance3D:
+	var key: Array = ["prism", size.x, size.y, size.z, mat.get_instance_id()]
+	var mesh: PrismMesh = null
+	if _mesh_cache.has(key):
+		mesh = _mesh_cache[key] as PrismMesh
+	else:
+		mesh = PrismMesh.new()
+		mesh.size = size
+		mesh.material = mat
+		_mesh_cache[key] = mesh
 	var mi := MeshInstance3D.new()
-	var mesh := PrismMesh.new()
-	mesh.size = size
-	mesh.material = mat
 	mi.mesh = mesh
 	mi.position = pos
 	return mi
 
-static func _sphere(radius: float, pos: Vector3, mat: Material) -> MeshInstance3D:
+static func _prism_slope(size: Vector3, pos: Vector3, mat: Material, left_to_right: float, rot_y_deg: float) -> MeshInstance3D:
+	# Single-slope wedge with its own FRESH mesh (never cached: the
+	# apex offset is a per-mesh property, and sharing a cached mesh
+	# would let one wedge's apex overwrite another's). PrismMesh's
+	# ridge runs along Z with the apex moving along X (probed), so
+	# callers pass rot_y_deg=90 to turn local X (slope run) into
+	# world Z: left_to_right 0 puts the tall edge at +Z (rear),
+	# 1 puts it at -Z (front).
 	var mi := MeshInstance3D.new()
-	var mesh := SphereMesh.new()
-	mesh.radius = radius
-	mesh.height = radius * 2.0
-	mesh.radial_segments = 12
-	mesh.rings = 8
+	var mesh := PrismMesh.new()
+	mesh.size = size
+	mesh.left_to_right = left_to_right
 	mesh.material = mat
+	mi.mesh = mesh
+	mi.position = pos
+	mi.rotation_degrees = Vector3(0, rot_y_deg, 0)
+	return mi
+
+static func _sphere(radius: float, pos: Vector3, mat: Material) -> MeshInstance3D:
+	var key: Array = ["sphere", radius, mat.get_instance_id()]
+	var mesh: SphereMesh = null
+	if _mesh_cache.has(key):
+		mesh = _mesh_cache[key] as SphereMesh
+	else:
+		mesh = SphereMesh.new()
+		mesh.radius = radius
+		mesh.height = radius * 2.0
+		mesh.radial_segments = 12
+		mesh.rings = 8
+		mesh.material = mat
+		_mesh_cache[key] = mesh
+	var mi := MeshInstance3D.new()
 	mi.mesh = mesh
 	mi.position = pos
 	return mi
 
 static func _wheel(radius: float, width: float, pos: Vector3) -> Node3D:
+	# Traffic wheel (signature + pivot contract UNCHANGED): ONE
+	# MeshInstance3D with TWO surfaces (dark: tyre + cap, metal: hub),
+	# so 4 wheels = 8 draws/car (was 12 MeshInstance3Ds). The merged
+	# mesh is shared by a car's 4 wheels WITHIN this builder call via
+	# the per-invocation cache. The cap's old mid-grey material is
+	# folded into the dark surface — the hub covers the centre, so
+	# the visible difference is negligible at traffic distance.
 	var wheel := Node3D.new()
 	wheel.position = pos
-	var tyre := _cyl(radius, radius, width, Vector3.ZERO, _std(Color(0.05, 0.05, 0.06), 0.0, 0.9), 14)
+	var key: Array = ["mwheel", radius, width]
+	var mesh: ArrayMesh = null
+	if _mesh_cache.has(key):
+		mesh = _mesh_cache[key] as ArrayMesh
+	else:
+		var dark := _std(Color(0.05, 0.05, 0.06), 0.0, 0.9)
+		var metal := _std(Color(0.55, 0.58, 0.62), 0.9, 0.3)
+		var rot := Transform3D(Basis(Vector3(0, 0, 1), PI * 0.5), Vector3.ZERO)
+		var surf_dark := _surf_new()
+		var surf_metal := _surf_new()
+		var tyre := CylinderMesh.new()
+		tyre.top_radius = radius
+		tyre.bottom_radius = radius
+		tyre.height = width
+		tyre.radial_segments = 14
+		_bake_append(surf_dark, tyre, rot)
+		var cap := CylinderMesh.new()
+		cap.top_radius = radius * 0.22
+		cap.bottom_radius = radius * 0.22
+		cap.height = width + 0.04
+		cap.radial_segments = 8
+		_bake_append(surf_dark, cap, rot)
+		var hub := CylinderMesh.new()
+		hub.top_radius = radius * 0.55
+		hub.bottom_radius = radius * 0.55
+		hub.height = width + 0.02
+		hub.radial_segments = 10
+		_bake_append(surf_metal, hub, rot)
+		mesh = _merged_mesh([surf_dark, surf_metal], [dark, metal])
+		_mesh_cache[key] = mesh
+	var mi := MeshInstance3D.new()
+	mi.mesh = mesh
+	wheel.add_child(mi)
+	return wheel
+
+static func _hero_wheel(radius: float, width: float, pos: Vector3) -> Node3D:
+	# Hero-only wheel: tyre + torus rim + bright hub + 2 spokes.
+	# Returns an UNNAMED pivot (the caller names it WheelFL/FR/RL/RR);
+	# player.gd spins it via rotation.x, so ALL geometry lives on the
+	# X axis. TorusMesh defaults to the Y axis (thin axis Y, probed)
+	# — the rim is rotated Z 90 deg into the YZ wheel plane, or it
+	# renders as a horizontal donut. Rim + spokes sit on the OUTBOARD
+	# face (sign of pos.x): the tyre is a capped solid, so a centred
+	# rim would be hidden inside it.
+	var wheel := Node3D.new()
+	wheel.position = pos
+	var out := 1.0 if pos.x >= 0.0 else -1.0
+	var tyre_mat := _std(Color(0.05, 0.05, 0.06), 0.0, 0.9)
+	var rim_mat := _std(Color(0.62, 0.64, 0.68), 0.9, 0.3)
+	var hub_mat := _std(Color(0.82, 0.82, 0.85), 0.9, 0.2)
+	var spoke_mat := _std(Color(0.35, 0.36, 0.39), 0.8, 0.35)
+	var tyre := _cyl(radius, radius, width, Vector3.ZERO, tyre_mat, 20)
 	tyre.rotation_degrees = Vector3(0, 0, 90)
 	wheel.add_child(tyre)
-	var hub := _cyl(radius * 0.55, radius * 0.55, width + 0.02, Vector3.ZERO, _std(Color(0.55, 0.58, 0.62), 0.9, 0.3), 10)
+	var rim := MeshInstance3D.new()
+	var torus := TorusMesh.new()
+	torus.inner_radius = radius * 0.45
+	torus.outer_radius = radius * 0.69
+	torus.rings = 8
+	torus.ring_segments = 20
+	torus.material = rim_mat
+	rim.mesh = torus
+	rim.position = Vector3(out * (width * 0.5 - 0.02), 0, 0)
+	rim.rotation_degrees = Vector3(0, 0, 90)
+	wheel.add_child(rim)
+	var hub := _cyl(radius * 0.33, radius * 0.33, width + 0.06, Vector3.ZERO, hub_mat, 12)
 	hub.rotation_degrees = Vector3(0, 0, 90)
 	wheel.add_child(hub)
-	var cap := _cyl(radius * 0.22, radius * 0.22, width + 0.04, Vector3.ZERO, _std(Color(0.15, 0.15, 0.17), 0.6, 0.4), 8)
-	cap.rotation_degrees = Vector3(0, 0, 90)
-	wheel.add_child(cap)
+	var spoke_len := radius * 1.28
+	for k in range(2):
+		var spoke := _box(Vector3(0.05, spoke_len, 0.12), Vector3(out * (width * 0.5 - 0.01), 0, 0), spoke_mat)
+		spoke.rotation_degrees = Vector3(90.0 * float(k), 0, 0)
+		wheel.add_child(spoke)
 	return wheel
 
 # ------------------------------------------------------- hero pickup
 
 static func build_hero_pickup(paint: Color) -> Node3D:
+	_cache_begin()
 	var root := Node3D.new()
 	root.name = "HeroPickup"
 	var body := Node3D.new()
@@ -98,12 +321,20 @@ static func build_hero_pickup(paint: Color) -> Node3D:
 		paint_metallic = 0.35
 		paint_rough = 0.32
 	var paint_mat := _std(paint_cool, paint_metallic, paint_rough)
+	# Two-tone lower band: the cooled paint darkened x0.85, same
+	# metallic/roughness as the main paint.
+	var paint_low_mat := _std(Color(paint_cool.r * 0.85, paint_cool.g * 0.85, paint_cool.b * 0.85), paint_metallic, paint_rough)
 	var dark_mat := _std(Color(0.08, 0.08, 0.1), 0.2, 0.6)
-	var glass_mat := _std(Color(0.02, 0.02, 0.04), 0.9, 0.08)
+	# Lane A — glass no longer mirrors the pink sky: metallic 0.45 /
+	# roughness 0.22 / dark blue-grey albedo, so the glasshouse reads
+	# dark glass instead of a pale mirror.
+	var glass_mat := _std(Color(0.03, 0.05, 0.08), 0.45, 0.22)
 	var trim_mat := _std(Color(0.12, 0.12, 0.14), 0.4, 0.5)
 
-	# Main lower hull — long, flat, sharp-edged.
-	body.add_child(_box(Vector3(2.0, 0.55, 4.6), Vector3(0, 0.62, 0), paint_mat))
+	# Two-tone hull: darker lower band (paint x0.85) with the main
+	# paint above it, so the lower body reads as a separate band.
+	body.add_child(_box(Vector3(2.0, 0.28, 4.6), Vector3(0, 0.44, 0), paint_low_mat))
+	body.add_child(_box(Vector3(1.94, 0.40, 4.6), Vector3(0, 0.70, 0), paint_mat))
 	# Angular nose wedge (prism slopes down toward the front, -Z).
 	var nose := _prism(Vector3(2.0, 0.5, 0.9), Vector3(0, 0.6, -2.35), paint_mat)
 	nose.rotation_degrees = Vector3(0, 180, 0)
@@ -112,41 +343,64 @@ static func build_hero_pickup(paint: Color) -> Node3D:
 	var hood := _box(Vector3(1.9, 0.1, 1.15), Vector3(0, 0.92, -1.55), paint_mat)
 	hood.rotation_degrees = Vector3(-4, 0, 0)
 	body.add_child(hood)
-	# Cab block, set back from the nose.
-	body.add_child(_box(Vector3(1.84, 0.52, 2.0), Vector3(0, 1.12, 0.55), paint_mat))
-	# Full-width black glass band wrapping the cab.
-	body.add_child(_box(Vector3(1.88, 0.34, 1.55), Vector3(0, 1.16, 0.55), glass_mat))
-	# Roof panel.
-	body.add_child(_box(Vector3(1.8, 0.08, 1.7), Vector3(0, 1.42, 0.55), paint_mat))
-	# Open bed: floor + side walls + tailgate.
-	body.add_child(_box(Vector3(1.9, 0.08, 1.35), Vector3(0, 0.92, 1.62), trim_mat))
-	body.add_child(_box(Vector3(0.08, 0.42, 1.35), Vector3(-0.94, 1.1, 1.62), paint_mat))
-	body.add_child(_box(Vector3(0.08, 0.42, 1.35), Vector3(0.94, 1.1, 1.62), paint_mat))
-	body.add_child(_box(Vector3(1.9, 0.42, 0.08), Vector3(0, 1.1, 2.28), paint_mat))
-	# Tailgate definition (rear face, +Z): a slightly darker inset
-	# panel, a thin horizontal character line, and a top rail so the
-	# rear reads as a tailgate + bumper, not one blank white slab.
-	# Round 5 — the inset is a rear face lit by the warm fill light
-	# plus the pink sky reflection, so a straight paint*0.78 still
-	# read pink-mauve (207,159,181). It gets a cooler tint (R pulled
-	# down hardest) and low metallic (less pink sky mirror) so the
-	# shaded tailgate panel reads cool white-grey, as a white panel
-	# in shadow should.
+	# Raked cab: narrower lower cab, two sloped glass prisms
+	# (windshield 25 deg, rear glass 27 deg), a narrower/shorter roof,
+	# side glass, and a dark inner block so no see-through gaps show
+	# between the glass prisms at glancing angles.
+	body.add_child(_box(Vector3(1.70, 0.30, 1.90), Vector3(0, 1.03, 0.55), paint_mat))
+	body.add_child(_box(Vector3(1.50, 0.24, 1.50), Vector3(0, 1.30, 0.50), dark_mat))
+	# PrismMesh's ridge runs along Z with the apex moving along X
+	# (probed: left_to_right 0 -> apex x=-half, 1 -> +half), so the
+	# glass wedges are rotated Y 90 deg: local X (slope run) becomes
+	# world Z. Windshield: tall edge at the rear (roof), sloping down
+	# to the hood. Rear glass: tall edge at the front, sloping down
+	# to the bed — the inset rear window, narrower than the cab.
+	body.add_child(_prism_slope(Vector3(0.55, 0.26, 1.62), Vector3(0, 1.31, -0.12), glass_mat, 0.0, 90.0))
+	body.add_child(_prism_slope(Vector3(0.50, 0.26, 1.62), Vector3(0, 1.31, 1.10), glass_mat, 1.0, 90.0))
+	# Side glass. (No A/C pillar boxes: an earlier iteration had
+	# them, and their white slabs covered the prisms' sloped side
+	# profiles and killed the rake read from the side. The prisms'
+	# triangles + the narrower roof carry the glasshouse shape.)
+	body.add_child(_box(Vector3(0.04, 0.26, 0.75), Vector3(-0.80, 1.31, 0.50), glass_mat))
+	body.add_child(_box(Vector3(0.04, 0.26, 0.75), Vector3(0.80, 1.31, 0.50), glass_mat))
+	# Roof panel: narrower and shorter than before.
+	body.add_child(_box(Vector3(1.50, 0.07, 0.85), Vector3(0, 1.455, 0.50), paint_mat))
+	# Open bed: darker floor + lower side walls (0.30 m) + tailgate.
+	body.add_child(_box(Vector3(1.9, 0.08, 1.35), Vector3(0, 0.92, 1.62), dark_mat))
+	body.add_child(_box(Vector3(0.08, 0.30, 1.35), Vector3(-0.94, 1.11, 1.62), paint_mat))
+	body.add_child(_box(Vector3(0.08, 0.30, 1.35), Vector3(0.94, 1.11, 1.62), paint_mat))
+	# Tailgate in THREE bands (>=0.12 m each): the old flat tailgate
+	# with micro-detail (0.015 m gaps, 0.025 m line) was below
+	# resolution at chase distance, so the gaps and the thin line are
+	# DELETED; the bands + one 0.06 m crease + two 0.04 m vertical
+	# creases carry the rear definition instead. The tailgate face
+	# stays at z=2.32 (same as before), so the exhaust anchor
+	# (0, 0.55, 2.3 in player space) keeps its old relationship to
+	# the rear face. All details stay proud of the face so nothing
+	# z-fights.
+	# Round 5 — the shaded tailgate panel is a rear face lit by the
+	# warm fill light plus the pink sky reflection, so a straight
+	# paint*0.78 still read pink-mauve (207,159,181). It gets a
+	# cooler tint (R pulled down hardest) and low metallic (less pink
+	# sky mirror) so the shaded tailgate panel reads cool white-grey,
+	# as a white panel in shadow should.
 	var paint_dark_mat := _std(Color(paint_cool.r * 0.68, paint_cool.g * 0.82, paint_cool.b * 0.85), 0.2, 0.35)
-	body.add_child(_box(Vector3(1.7, 0.30, 0.02), Vector3(0, 1.12, 2.325), paint_dark_mat))
-	body.add_child(_box(Vector3(1.86, 0.025, 0.02), Vector3(0, 0.94, 2.325), dark_mat))
-	body.add_child(_box(Vector3(1.92, 0.05, 0.10), Vector3(0, 1.33, 2.28), trim_mat))
-	# Round 4 — rear definition (silhouette unchanged, all details
-	# proud of the tailgate face at z=2.32 so nothing z-fights):
-	# vertical panel gaps splitting the tailgate into three panels,
-	# a number-plate recess + pale plate on the valance, a chrome
-	# exhaust tip bottom-right, a tread step on the bumper top, dark
-	# bed rail caps along both bed walls, and red wrap-around corner
-	# pods on the bed sides so the taillights turn the corner.
-	var gap_mat := dark_mat
-	body.add_child(_box(Vector3(0.015, 0.26, 0.015), Vector3(-0.55, 1.12, 2.338), gap_mat))
-	body.add_child(_box(Vector3(0.015, 0.26, 0.015), Vector3(0.55, 1.12, 2.338), gap_mat))
-	body.add_child(_box(Vector3(1.7, 0.015, 0.015), Vector3(0, 0.985, 2.338), gap_mat))
+	# Lead tuning 2026-11-12: the tailgate creases in near-black dark_mat
+	# read as a bold black cross at chase distance (coastal + neon
+	# renders). Mid-grey seam tone — visible definition, not a bar.
+	var crease_mat := _std(Color(0.42, 0.42, 0.46), 0.2, 0.5)
+	body.add_child(_box(Vector3(1.9, 0.14, 0.08), Vector3(0, 1.24, 2.28), paint_mat))
+	body.add_child(_box(Vector3(1.9, 0.14, 0.08), Vector3(0, 1.10, 2.28), paint_dark_mat))
+	body.add_child(_box(Vector3(1.9, 0.14, 0.08), Vector3(0, 0.96, 2.28), paint_mat))
+	body.add_child(_box(Vector3(1.92, 0.05, 0.10), Vector3(0, 1.285, 2.28), trim_mat))
+	body.add_child(_box(Vector3(1.70, 0.06, 0.015), Vector3(0, 1.10, 2.325), crease_mat))
+	body.add_child(_box(Vector3(0.04, 0.30, 0.015), Vector3(-0.55, 1.10, 2.325), crease_mat))
+	body.add_child(_box(Vector3(0.04, 0.30, 0.015), Vector3(0.55, 1.10, 2.325), crease_mat))
+	# Round 4 — rear definition kept: a number-plate recess + pale
+	# plate on the valance, a chrome exhaust tip bottom-right, a
+	# tread step on the bumper top, dark bed rail caps along both bed
+	# walls, and red wrap-around corner pods on the bed sides so the
+	# taillights turn the corner.
 	# Number plate: dark recess, then a pale plate inside it.
 	body.add_child(_box(Vector3(0.56, 0.17, 0.02), Vector3(0, 0.66, 2.325), dark_mat))
 	body.add_child(_box(Vector3(0.46, 0.11, 0.015), Vector3(0, 0.66, 2.34), _std(Color(0.85, 0.85, 0.80), 0.2, 0.5)))
@@ -161,8 +415,8 @@ static func build_hero_pickup(paint: Color) -> Node3D:
 	# Bumper tread step: a dark grip strip across the bumper top.
 	body.add_child(_box(Vector3(1.6, 0.03, 0.18), Vector3(0, 0.46, 2.34), dark_mat))
 	# Bed rail caps: dark caps on top of both bed side walls.
-	body.add_child(_box(Vector3(0.10, 0.04, 1.35), Vector3(-0.94, 1.33, 1.62), trim_mat))
-	body.add_child(_box(Vector3(0.10, 0.04, 1.35), Vector3(0.94, 1.33, 1.62), trim_mat))
+	body.add_child(_box(Vector3(0.10, 0.04, 1.35), Vector3(-0.94, 1.28, 1.62), trim_mat))
+	body.add_child(_box(Vector3(0.10, 0.04, 1.35), Vector3(0.94, 1.28, 1.62), trim_mat))
 	# Wrap-around rear corner pods (red, emissive) on the bed sides.
 	# Round 6 — emission (1.0,0.02,0.02) @ 1.0 measured orange-red
 	# (255,60,36): the G comes from ACES desaturation of the bright
@@ -179,13 +433,33 @@ static func build_hero_pickup(paint: Color) -> Node3D:
 	# band under the hero; it must read as dark GREY with shape.
 	var rear_panel_mat := _std(Color(0.38, 0.38, 0.42), 0.3, 0.55)
 	body.add_child(_box(Vector3(1.9, 0.28, 0.02), Vector3(0, 0.62, 2.31), rear_panel_mat))
-	# Bed roll bar.
-	body.add_child(_box(Vector3(1.7, 0.07, 0.07), Vector3(0, 1.52, 0.95), dark_mat))
-	body.add_child(_box(Vector3(0.07, 0.55, 0.07), Vector3(-0.8, 1.28, 0.95), dark_mat))
-	body.add_child(_box(Vector3(0.07, 0.55, 0.07), Vector3(0.8, 1.28, 0.95), dark_mat))
-	# Side skirts + wheel-arch trim.
-	body.add_child(_box(Vector3(0.06, 0.18, 4.3), Vector3(-1.0, 0.42, 0), trim_mat))
-	body.add_child(_box(Vector3(0.06, 0.18, 4.3), Vector3(1.0, 0.42, 0), trim_mat))
+	# Bed roll bar: crossbar BELOW the roofline (roof top 1.49), legs
+	# rising from the bed floor behind the cab.
+	body.add_child(_box(Vector3(1.7, 0.07, 0.07), Vector3(0, 1.41, 1.58), dark_mat))
+	body.add_child(_box(Vector3(0.07, 0.42, 0.07), Vector3(-0.8, 1.17, 1.58), dark_mat))
+	body.add_child(_box(Vector3(0.07, 0.42, 0.07), Vector3(0.8, 1.17, 1.58), dark_mat))
+	# Split side skirts (3 segments per side, gaps at the wheels) +
+	# front fender brows, rear haunches, dark wheel-well insets and
+	# one side character line per side. ALL under Body: they rotate
+	# with the body in stunts; only tyre/rim/spokes live under the
+	# wheel pivots.
+	for side in [-1, 1]:
+		var sx := float(side)
+		body.add_child(_box(Vector3(0.08, 0.18, 0.50), Vector3(sx * 1.0, 0.40, -2.20), trim_mat))
+		body.add_child(_box(Vector3(0.08, 0.18, 1.90), Vector3(sx * 1.0, 0.40, 0), trim_mat))
+		body.add_child(_box(Vector3(0.08, 0.18, 0.50), Vector3(sx * 1.0, 0.40, 2.20), trim_mat))
+		body.add_child(_box(Vector3(0.38, 0.09, 1.05), Vector3(sx * 1.03, 0.87, -1.45), paint_mat))
+		var haunch := _box(Vector3(0.30, 0.10, 0.95), Vector3(sx * 1.02, 0.88, 1.45), paint_mat)
+		haunch.rotation_degrees = Vector3(-12, 0, 0)
+		body.add_child(haunch)
+		# Wheel-well insets: shadow pockets SMALLER than the tyre, so
+		# the dark shows at the tyre's sides only — a full-size panel
+		# read as a black slab from the side.
+		body.add_child(_box(Vector3(0.05, 0.60, 0.90), Vector3(sx * 0.98, 0.44, -1.45), dark_mat))
+		body.add_child(_box(Vector3(0.05, 0.60, 0.90), Vector3(sx * 0.98, 0.44, 1.45), dark_mat))
+		var charline := _box(Vector3(0.03, 0.05, 3.20), Vector3(sx * 0.975, 0.74, -0.20), trim_mat)
+		charline.rotation_degrees = Vector3(-2, 0, 0)
+		body.add_child(charline)
 	# Front grille (dark, no logo) + bumpers.
 	body.add_child(_box(Vector3(1.7, 0.22, 0.08), Vector3(0, 0.62, -2.78), dark_mat))
 	body.add_child(_box(Vector3(2.02, 0.16, 0.22), Vector3(0, 0.38, -2.72), trim_mat))
@@ -241,26 +515,30 @@ static func build_hero_pickup(paint: Color) -> Node3D:
 	body.add_child(glow)
 
 	# Wheels (siblings of Body — Body rotates for stunts, wheels stay put).
+	# Wider track (x=+-1.02) + bigger wheels (r=0.42) so the wheels
+	# stand proud of the 2.0 m hull and read from the chase camera.
 	var wheels := Node3D.new()
 	wheels.name = "Wheels"
 	root.add_child(wheels)
-	var fl := _wheel(0.38, 0.3, Vector3(-0.95, 0.38, -1.45))
+	var fl := _hero_wheel(0.42, 0.34, Vector3(-1.02, 0.42, -1.45))
 	fl.name = "WheelFL"
-	var fr := _wheel(0.38, 0.3, Vector3(0.95, 0.38, -1.45))
+	var fr := _hero_wheel(0.42, 0.34, Vector3(1.02, 0.42, -1.45))
 	fr.name = "WheelFR"
-	var rl := _wheel(0.38, 0.3, Vector3(-0.95, 0.38, 1.45))
+	var rl := _hero_wheel(0.42, 0.34, Vector3(-1.02, 0.42, 1.45))
 	rl.name = "WheelRL"
-	var rr := _wheel(0.38, 0.3, Vector3(0.95, 0.38, 1.45))
+	var rr := _hero_wheel(0.42, 0.34, Vector3(1.02, 0.42, 1.45))
 	rr.name = "WheelRR"
 	wheels.add_child(fl)
 	wheels.add_child(fr)
 	wheels.add_child(rl)
 	wheels.add_child(rr)
+	_cache_end()
 	return root
 
 # ------------------------------------------------------- traffic cars
 
 static func build_traffic_car(kind: String, color: Color) -> Node3D:
+	_cache_begin()
 	var root := Node3D.new()
 	root.name = "Traffic_" + kind
 	var body := Node3D.new()
@@ -328,10 +606,10 @@ static func build_traffic_car(kind: String, color: Color) -> Node3D:
 	# shows its red rear lamps even when it is not braking, and at
 	# 0.15 the lamps were invisible against the dark rear.
 	var rear_z := length * 0.5 + 0.01
-	var brake_l := _box(Vector3(0.5, 0.16, 0.06), Vector3(-width * 0.32, 0.78, rear_z), _std(Color(0.6, 0.02, 0.02), 0.0, 0.3, Color(1.0, 0.05, 0.05), 0.55))
+	var brake_l := _box_uniq(Vector3(0.5, 0.16, 0.06), Vector3(-width * 0.32, 0.78, rear_z), _std_fresh(Color(0.6, 0.02, 0.02), 0.0, 0.3, Color(1.0, 0.05, 0.05), 0.55))
 	brake_l.name = "BrakeL"
 	body.add_child(brake_l)
-	var brake_r := _box(Vector3(0.5, 0.16, 0.06), Vector3(width * 0.32, 0.78, rear_z), _std(Color(0.6, 0.02, 0.02), 0.0, 0.3, Color(1.0, 0.05, 0.05), 0.55))
+	var brake_r := _box_uniq(Vector3(0.5, 0.16, 0.06), Vector3(width * 0.32, 0.78, rear_z), _std_fresh(Color(0.6, 0.02, 0.02), 0.0, 0.3, Color(1.0, 0.05, 0.05), 0.55))
 	brake_r.name = "BrakeR"
 	body.add_child(brake_r)
 	# Thin red reflector strip across the rear, low glow: a continuous
@@ -341,10 +619,10 @@ static func build_traffic_car(kind: String, color: Color) -> Node3D:
 	# Indicators (amber, front + rear, per side).
 	for side in [-1, 1]:
 		var tag := "L" if side < 0 else "R"
-		var ind_f := _box(Vector3(0.18, 0.1, 0.06), Vector3(side * width * 0.42, 0.62, -length * 0.5 - 0.01), _std(Color(0.8, 0.4, 0.0), 0.0, 0.3, Color(1.0, 0.55, 0.0), 0.12))
+		var ind_f := _box_uniq(Vector3(0.18, 0.1, 0.06), Vector3(side * width * 0.42, 0.62, -length * 0.5 - 0.01), _std_fresh(Color(0.8, 0.4, 0.0), 0.0, 0.3, Color(1.0, 0.55, 0.0), 0.12))
 		ind_f.name = "IndicatorF" + tag
 		body.add_child(ind_f)
-		var ind_r := _box(Vector3(0.18, 0.1, 0.06), Vector3(side * width * 0.42, 0.78, rear_z), _std(Color(0.8, 0.4, 0.0), 0.0, 0.3, Color(1.0, 0.55, 0.0), 0.12))
+		var ind_r := _box_uniq(Vector3(0.18, 0.1, 0.06), Vector3(side * width * 0.42, 0.78, rear_z), _std_fresh(Color(0.8, 0.4, 0.0), 0.0, 0.3, Color(1.0, 0.55, 0.0), 0.12))
 		ind_r.name = "IndicatorR" + tag
 		body.add_child(ind_r)
 
@@ -357,6 +635,7 @@ static func build_traffic_car(kind: String, color: Color) -> Node3D:
 		for sz in [-1, 1]:
 			var w := _wheel(0.34, 0.26, Vector3(sx * (width * 0.5 - 0.05), 0.34, sz * wheel_z))
 			wheels.add_child(w)
+	_cache_end()
 	return root
 
 static func set_brake_lights(car: Node3D, on: bool) -> void:
@@ -402,24 +681,30 @@ static func set_indicator(car: Node3D, side: int, on: bool) -> void:
 # ------------------------------------------------------- pickups
 
 static func _coin(color: Color, rim: Color) -> Node3D:
+	_cache_begin()
 	var root := Node3D.new()
 	root.name = "Coin"
 	var face_mat := _std(color, 0.95, 0.18, color, 0.35)
-	var coin := _cyl(0.35, 0.35, 0.08, Vector3.ZERO, face_mat, 20)
+	var coin := _cyl(0.35, 0.35, 0.08, Vector3.ZERO, face_mat, 16)
 	coin.rotation_degrees = Vector3(90, 0, 0)
 	root.add_child(coin)
 	var rim_mesh := MeshInstance3D.new()
 	var torus := TorusMesh.new()
 	torus.inner_radius = 0.27
 	torus.outer_radius = 0.35
-	torus.rings = 8
-	torus.ring_segments = 20
+	torus.rings = 6
+	torus.ring_segments = 16
 	torus.material = _std(rim, 0.9, 0.25)
 	rim_mesh.mesh = torus
+	# Lead fix 2026-11-12: TorusMesh rings lie in the XZ plane — unrotated
+	# the rim rendered as a horizontal bar across the coin face. Rotate
+	# into the face plane (same convention as the face/hub cylinders).
+	rim_mesh.rotation_degrees = Vector3(90, 0, 0)
 	root.add_child(rim_mesh)
-	var hub := _cyl(0.12, 0.12, 0.1, Vector3.ZERO, _std(rim, 0.9, 0.2), 10)
+	var hub := _cyl(0.12, 0.12, 0.1, Vector3.ZERO, _std(rim, 0.9, 0.2), 8)
 	hub.rotation_degrees = Vector3(90, 0, 0)
 	root.add_child(hub)
+	_cache_end()
 	return root
 
 static func build_coin() -> Node3D:
@@ -429,6 +714,7 @@ static func build_air_coin() -> Node3D:
 	return _coin(Color(0.25, 0.65, 1.0), Color(0.1, 0.4, 0.9))
 
 static func build_pickup_orb(kind: String) -> Node3D:
+	_cache_begin()
 	var root := Node3D.new()
 	root.name = "Orb_" + kind
 	var core_color := Color(1.0, 0.5, 0.1)
@@ -451,11 +737,16 @@ static func build_pickup_orb(kind: String) -> Node3D:
 	var gem := _box(Vector3(0.22, 0.22, 0.22), Vector3.ZERO, _std(Color(1, 1, 1), 0.0, 0.1, Color(1, 1, 1), 4.0))
 	gem.rotation_degrees = Vector3(45, 45, 0)
 	root.add_child(gem)
+	_cache_end()
 	return root
 
 static func _make_glow_texture(size: int) -> ImageTexture:
 	# Soft radial falloff: hot centre, transparent edges. Used by the
 	# hero underglow so it reads as light pooling under the car.
+	# Cached GLOBALLY (one texture per size): textures are never
+	# mutated, so sharing across heroes is safe.
+	if _glow_tex_cache.has(size):
+		return _glow_tex_cache[size] as ImageTexture
 	var img := Image.create(size, size, false, Image.FORMAT_RGBA8)
 	var half := float(size) * 0.5
 	for y in range(size):
@@ -465,41 +756,48 @@ static func _make_glow_texture(size: int) -> ImageTexture:
 			var d: float = clamp(sqrt(dx * dx + dy * dy), 0.0, 1.0)
 			var t := pow(1.0 - d, 1.8)
 			img.set_pixel(x, y, Color(1.0, 1.0, 1.0, t))
-	return ImageTexture.create_from_image(img)
+	var tex := ImageTexture.create_from_image(img)
+	_glow_tex_cache[size] = tex
+	return tex
 
 # ------------------------------------------------------- palm tree
 
+static func _palm_materials() -> Array:
+	# The 5 palm materials, created ONCE and shared by every palm:
+	# leaf/trunk materials are never mutated (world_builder touches
+	# only each palm root's position/rotation/scale/visible), so
+	# global sharing is safe. Fronds must read GREEN, not yellow
+	# umbrellas: deep green albedo, a faint GREEN (not orange)
+	# emission lift, and two alternating shades so individual leaves
+	# separate from each other. The third, darker shade is the
+	# under-ring: leaves in shadow under the crown.
+	if _palm_trunk_mat == null:
+		_palm_trunk_mat = _std_fresh(Color(0.45, 0.30, 0.17), 0.0, 0.85)
+		_palm_leaf_mat = _std_fresh(Color(0.07, 0.40, 0.15), 0.0, 0.6, Color(0.05, 0.25, 0.08), 0.15)
+		_palm_leaf_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+		_palm_leaf_mat2 = _std_fresh(Color(0.05, 0.30, 0.11), 0.0, 0.6, Color(0.04, 0.20, 0.06), 0.15)
+		_palm_leaf_mat2.cull_mode = BaseMaterial3D.CULL_DISABLED
+		_palm_leaf_mat3 = _std_fresh(Color(0.03, 0.18, 0.07), 0.0, 0.7, Color(0.02, 0.12, 0.04), 0.15)
+		_palm_leaf_mat3.cull_mode = BaseMaterial3D.CULL_DISABLED
+		_palm_nut_mat = _std_fresh(Color(0.35, 0.22, 0.1), 0.0, 0.8)
+	return [_palm_trunk_mat, _palm_leaf_mat, _palm_leaf_mat2, _palm_leaf_mat3, _palm_nut_mat]
+
 static func build_palm() -> Node3D:
+	# ONE ArrayMesh, 5 surfaces (trunk, leaf x3, nuts) sharing the 5
+	# global palm materials: 65 draws/palm -> 5. Every part bakes the
+	# EXACT segment/leaf transforms the old 65-node builder computed
+	# (same deterministic jitter), so the silhouette is identical.
+	# The per-palm root Node3D keeps its origin at the trunk base;
+	# scroll/_place_palm/_apply_palette touch only root
+	# position/rotation/scale/visible, which this preserves exactly.
 	var root := Node3D.new()
 	root.name = "Palm"
-	var trunk_mat := _std(Color(0.45, 0.30, 0.17), 0.0, 0.85)
-	# Fronds must read GREEN, not yellow umbrellas: deep green albedo,
-	# a faint GREEN (not orange) emission lift, and two alternating
-	# shades so individual leaves separate from each other.
-	var leaf_mat := StandardMaterial3D.new()
-	leaf_mat.albedo_color = Color(0.07, 0.40, 0.15)
-	leaf_mat.roughness = 0.6
-	leaf_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
-	leaf_mat.emission_enabled = true
-	leaf_mat.emission = Color(0.05, 0.25, 0.08)
-	leaf_mat.emission_energy_multiplier = 0.15
-	var leaf_mat2 := StandardMaterial3D.new()
-	leaf_mat2.albedo_color = Color(0.05, 0.30, 0.11)
-	leaf_mat2.roughness = 0.6
-	leaf_mat2.cull_mode = BaseMaterial3D.CULL_DISABLED
-	leaf_mat2.emission_enabled = true
-	leaf_mat2.emission = Color(0.04, 0.20, 0.06)
-	leaf_mat2.emission_energy_multiplier = 0.15
-	# Third, darker shade for the under-ring: leaves in shadow under
-	# the crown, so close-ups get a dark layer beneath the lit fronds.
-	var leaf_mat3 := StandardMaterial3D.new()
-	leaf_mat3.albedo_color = Color(0.03, 0.18, 0.07)
-	leaf_mat3.roughness = 0.7
-	leaf_mat3.cull_mode = BaseMaterial3D.CULL_DISABLED
-	leaf_mat3.emission_enabled = true
-	leaf_mat3.emission = Color(0.02, 0.12, 0.04)
-	leaf_mat3.emission_energy_multiplier = 0.15
-	var nut_mat := _std(Color(0.35, 0.22, 0.1), 0.0, 0.8)
+	var mats := _palm_materials()
+	var surf_trunk := _surf_new()
+	var surf_leaf1 := _surf_new()
+	var surf_leaf2 := _surf_new()
+	var surf_leaf3 := _surf_new()
+	var surf_nuts := _surf_new()
 
 	# Bent trunk: 5 stacked tapering segments following ONE smooth
 	# curve. Each segment's centre is placed along the tangent of the
@@ -514,10 +812,12 @@ static func build_palm() -> Node3D:
 		var theta := lean_total * float(i) / 4.0
 		var r_top := 0.16 - float(i) * 0.018
 		var r_bot := 0.18 - float(i) * 0.018
-		var seg := _cyl(r_top, r_bot, 0.95, Vector3.ZERO, trunk_mat, 7)
-		seg.rotation_degrees = Vector3(0, 0, -rad_to_deg(theta))
-		seg.position = Vector3(bx + sin(theta) * 0.475, by + cos(theta) * 0.475, 0)
-		root.add_child(seg)
+		var seg := CylinderMesh.new()
+		seg.top_radius = r_top
+		seg.bottom_radius = r_bot
+		seg.height = 0.95
+		seg.radial_segments = 7
+		_bake_append(surf_trunk, seg, Transform3D(Basis(Vector3(0, 0, 1), -theta), Vector3(bx + sin(theta) * 0.475, by + cos(theta) * 0.475, 0)))
 		bx += sin(theta) * 0.95
 		by += cos(theta) * 0.95
 	var top := Vector3(bx, by + 0.15, 0)
@@ -544,27 +844,33 @@ static func build_palm() -> Node3D:
 			var leaf_len := length * (1.0 + jitter * 0.25)
 			var leaf_droop := droop + jitter * 28.0
 			var roll := jitter * 36.0
-			var lm: StandardMaterial3D = leaf_mat3 if ring == 2 else (leaf_mat if (i + ring) % 2 == 0 else leaf_mat2)
-			var pivot := Node3D.new()
-			pivot.position = Vector3(top.x, ring_y, top.z)
-			pivot.rotation_degrees = Vector3(0, float(i) * (360.0 / float(count)) + float(ring) * 22.0, 0)
-			root.add_child(pivot)
+			var surf: Dictionary = surf_leaf3 if ring == 2 else (surf_leaf1 if (i + ring) % 2 == 0 else surf_leaf2)
+			var pivot_xform := Transform3D(Basis(Vector3.UP, deg_to_rad(float(i) * (360.0 / float(count)) + float(ring) * 22.0)), Vector3(top.x, ring_y, top.z))
 			# V-fold: two halves, outer edges tilted down from the
 			# midrib, plus the per-leaf roll so no two leaves sit flat.
+			# Basis.from_euler matches Node3D rotation exactly
+			# (probed), so these baked transforms equal the old
+			# pivot + rotation_degrees hierarchy.
 			var half_w := 0.24
-			var leaf_a := _box(Vector3(leaf_len, 0.05, half_w), Vector3(leaf_len * 0.5, 0.05, -half_w * 0.46), lm)
-			leaf_a.rotation_degrees = Vector3(-30.0 + roll, 0, leaf_droop)
-			pivot.add_child(leaf_a)
-			var leaf_b := _box(Vector3(leaf_len, 0.05, half_w), Vector3(leaf_len * 0.5, 0.05, half_w * 0.46), lm)
-			leaf_b.rotation_degrees = Vector3(30.0 + roll, 0, leaf_droop)
-			pivot.add_child(leaf_b)
+			var leaf_mesh := BoxMesh.new()
+			leaf_mesh.size = Vector3(leaf_len, 0.05, half_w)
+			_bake_append(surf, leaf_mesh, pivot_xform * Transform3D(Basis.from_euler(Vector3(deg_to_rad(-30.0 + roll), 0, deg_to_rad(leaf_droop))), Vector3(leaf_len * 0.5, 0.05, -half_w * 0.46)))
+			_bake_append(surf, leaf_mesh, pivot_xform * Transform3D(Basis.from_euler(Vector3(deg_to_rad(30.0 + roll), 0, deg_to_rad(leaf_droop))), Vector3(leaf_len * 0.5, 0.05, half_w * 0.46)))
 			# Leaf tip flicks back up slightly (second segment).
-			var tip := _box(Vector3(leaf_len * 0.35, 0.04, 0.3), Vector3(leaf_len * 0.92, -0.28, 0), lm)
-			tip.rotation_degrees = Vector3(roll * 0.5, 0, leaf_droop - 22.0)
-			pivot.add_child(tip)
+			var tip_mesh := BoxMesh.new()
+			tip_mesh.size = Vector3(leaf_len * 0.35, 0.04, 0.3)
+			_bake_append(surf, tip_mesh, pivot_xform * Transform3D(Basis.from_euler(Vector3(deg_to_rad(roll * 0.5), 0, deg_to_rad(leaf_droop - 22.0))), Vector3(leaf_len * 0.92, -0.28, 0)))
 
 	# Coconut cluster under the crown.
 	for i in range(3):
 		var a := float(i) * 2.1
-		root.add_child(_sphere(0.11, top + Vector3(cos(a) * 0.18, -0.18, sin(a) * 0.18), nut_mat))
+		var nut := SphereMesh.new()
+		nut.radius = 0.11
+		nut.height = 0.22
+		nut.radial_segments = 12
+		nut.rings = 8
+		_bake_append(surf_nuts, nut, Transform3D(Basis(), top + Vector3(cos(a) * 0.18, -0.18, sin(a) * 0.18)))
+	var mi := MeshInstance3D.new()
+	mi.mesh = _merged_mesh([surf_trunk, surf_leaf1, surf_leaf2, surf_leaf3, surf_nuts], mats)
+	root.add_child(mi)
 	return root

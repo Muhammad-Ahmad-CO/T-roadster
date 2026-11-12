@@ -52,6 +52,7 @@ var _distance: float = 0.0
 var _speed: float = 0.0
 var _trauma: float = 0.0
 var _cam_base_pos := Vector3(0, 3.2, 7.5)
+var _cam_x: float = 0.0 # damped camera x-follow; snapped to the hero in start_run/_to_menu
 var _shake_time: float = 0.0
 var _countdown_start_msec: int = 0
 var _countdown_step: int = -1
@@ -83,7 +84,9 @@ func _ready() -> void:
 	_build_gameplay()
 	_build_ui()
 	_wire_signals()
-	_pick_biome()
+	# Menu backdrop is always coastal (the hero biome); each run picks
+	# its own biome in start_run. _to_menu() re-forces coastal on entry.
+	_biome = "coastal"
 	_apply_biome()
 	_to_menu()
 
@@ -145,7 +148,7 @@ func _build_fallback_environment() -> void:
 	_environment.fog_light_color = Color(0.9, 0.55, 0.45)
 	_environment.fog_density = 0.008
 	_environment.fog_sky_affect = 0.5
-	_environment.glow_enabled = true
+	_environment.glow_enabled = false
 	_environment.glow_intensity = 0.5
 	_environment.glow_bloom = 0.08
 	_environment.glow_blend_mode = Environment.GLOW_BLEND_MODE_SOFTLIGHT
@@ -287,18 +290,18 @@ func _wire_signals() -> void:
 # ------------------------------------------------------------------- biome
 
 func _pick_biome() -> void:
-	# Weighted per spec (coastal 40 / neon 25 / canyon 20 / desert 15),
-	# with snow + rain as low-weight variants (5% each) from the same pool.
+	# Weighted: coastal is the default/hero biome (50%), neon 20%,
+	# canyon 15%, desert 10%, snow + rain 2.5% each.
 	var r: float = randf()
-	if r < 0.36:
+	if r < 0.50:
 		_biome = "coastal"
-	elif r < 0.58:
+	elif r < 0.70:
 		_biome = "neon"
-	elif r < 0.76:
+	elif r < 0.85:
 		_biome = "canyon"
-	elif r < 0.90:
-		_biome = "desert"
 	elif r < 0.95:
+		_biome = "desert"
+	elif r < 0.975:
 		_biome = "snow"
 	else:
 		_biome = "rain"
@@ -337,15 +340,16 @@ func _apply_biome() -> void:
 # ------------------------------------------------------------------- flow
 
 func start_run() -> void:
-	# TEST SITE intro (SPEC §2.5 + §3.4): the first run opens at night
-	# on the ramp. The intro run uses the existing neon night biome via
-	# the normal _apply_biome path — no palette values change, and later
-	# runs pick biomes randomly as before.
+	# TEST SITE intro (SPEC §2.5 + §3.4): the first run opens on the ramp
+	# in the coastal sunset biome — the intro is decoupled from the biome,
+	# so the TEST SITE moment plays in daylight. The ramp, banner,
+	# auto-flip, spawn hold and once-ever flag are unchanged; only the
+	# biome assignment differs. Later runs pick biomes randomly.
 	_intro_active = not scoring.test_site_intro_played
 	_intro_launched = false
 	_intro_auto_flip_timer = -1.0
 	if _intro_active:
-		_biome = "neon"
+		_biome = "coastal"
 	else:
 		_pick_biome()
 	_apply_biome()
@@ -353,6 +357,12 @@ func start_run() -> void:
 	player.set_paint(scoring.selected_paint)
 	player.reset_run()
 	player.active = false
+	# Snap the damped camera follow to the hero and frame the countdown:
+	# camera updates only run in PLAYING, so without this the countdown
+	# would freeze at the previous run's camera x.
+	_cam_x = player.position.x
+	_camera.position = Vector3(_cam_x, _cam_base_pos.y + player.position.y * 0.3, _cam_base_pos.z)
+	_camera.look_at(Vector3(_cam_x, 1.0 + player.position.y * 0.3, -12.0), Vector3.UP)
 	traffic.start_run()
 	if _intro_active:
 		# Same ramp construction as the in-run ramp, placed 20 m ahead
@@ -401,6 +411,7 @@ func _to_menu() -> void:
 	_environment.adjustment_saturation = _base_saturation
 	player.active = false
 	player.reset_run()
+	_cam_x = player.position.x
 	traffic.clear_all()
 	_intro_active = false
 	_intro_launched = false
@@ -415,6 +426,10 @@ func _to_menu() -> void:
 	hud.set_in_game(false)
 	hud.hide_countdown()
 	hud.hide_test_site_banner()
+	# Menu backdrop is always coastal, on every menu entry.
+	if world != null:
+		_biome = "coastal"
+		_apply_biome()
 	menus.show_home()
 
 func _on_pause_pressed() -> void:
@@ -620,8 +635,11 @@ func _physics_process(delta: float) -> void:
 		sin(_shake_time * 61.0) * sh,
 		sin(_shake_time * 47.0 + 1.3) * sh,
 		0.0)
-	_camera.position = Vector3(player.position.x * 0.4, _cam_base_pos.y + player.position.y * 0.3, _cam_base_pos.z) + off
-	_camera.look_at(Vector3(player.position.x * 0.4, 1.0 + player.position.y * 0.3, -12.0), Vector3.UP)
+	# Damped 1.0 follow: the camera tracks the hero's lane fully, so the
+	# hero never slides past the frame edge at lanes ±4.5.
+	_cam_x = lerpf(_cam_x, player.position.x, 1.0 - exp(-5.5 * delta))
+	_camera.position = Vector3(_cam_x, _cam_base_pos.y + player.position.y * 0.3, _cam_base_pos.z) + off
+	_camera.look_at(Vector3(_cam_x, 1.0 + player.position.y * 0.3, -12.0), Vector3.UP)
 
 # ------------------------------------------------------------------- scoring events
 

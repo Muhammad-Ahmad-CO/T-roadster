@@ -42,6 +42,9 @@ var _roll_button: Button
 var _boost_button: Button
 var _root: Control
 var _last_score: int = -1
+var _style_cache: Dictionary = {} # Button -> [normal StyleBoxFlat, pressed StyleBoxFlat, radius]
+var _last_airborne: int = -1 # -1 = unknown sentinel: the first set_airborne call must apply
+var _last_boost_ready: int = -1 # -1 = unknown sentinel: built BOOST alpha (0.75) differs from set_boost_ready(true) alpha (0.85)
 
 static func load_font(path: String) -> Font:
 	if ResourceLoader.exists(path):
@@ -212,6 +215,19 @@ func _build() -> void:
 	_hop_button.button_up.connect(func() -> void: hop_released.emit())
 
 func _style_button(b: Button, bg: Color, radius: int) -> void:
+	# Per-button cache: each button keeps its OWN StyleBoxFlat pair, never
+	# shared with another button (colours differ per button). Repeat calls
+	# mutate the cached boxes instead of allocating new ones every tick —
+	# set_airborne/set_boost_ready run every physics frame.
+	if _style_cache.has(b):
+		var cached: Array = _style_cache[b]
+		if int(cached[2]) == radius:
+			var cached_normal: StyleBoxFlat = cached[0]
+			var cached_pressed: StyleBoxFlat = cached[1]
+			cached_normal.bg_color = bg
+			cached_pressed.bg_color = Color(bg.r, bg.g, bg.b, minf(bg.a + 0.25, 1.0))
+			b.add_theme_color_override("font_color", Color.WHITE)
+			return
 	var normal := StyleBoxFlat.new()
 	normal.bg_color = bg
 	normal.corner_radius_top_left = radius
@@ -225,6 +241,7 @@ func _style_button(b: Button, bg: Color, radius: int) -> void:
 	pressed.bg_color = Color(bg.r, bg.g, bg.b, minf(bg.a + 0.25, 1.0))
 	b.add_theme_stylebox_override("pressed", pressed)
 	b.add_theme_color_override("font_color", Color.WHITE)
+	_style_cache[b] = [normal, pressed, radius]
 
 func _make_touch_button(text: String, pos: Vector2, size: Vector2, bg: Color) -> Button:
 	var b := Button.new()
@@ -328,13 +345,21 @@ func _prune_callout(l: Label) -> void:
 
 func set_airborne(b: bool) -> void:
 	# FLIP / ROLL go gold only while airborne; dimmed on the road.
+	_flip_button.disabled = false
+	_roll_button.disabled = false
+	var v: int = 1 if b else 0
+	if v == _last_airborne:
+		return # unchanged: skip the restyle entirely
+	_last_airborne = v
 	var gold := Color(1.0, 0.78, 0.2, 0.85 if b else 0.45)
 	_style_button(_flip_button, gold, 18)
 	_style_button(_roll_button, gold, 18)
-	_flip_button.disabled = false
-	_roll_button.disabled = false
 
 func set_boost_ready(b: bool) -> void:
+	var v: int = 1 if b else 0
+	if v == _last_boost_ready:
+		return # unchanged: skip the restyle entirely
+	_last_boost_ready = v
 	var bg := Color(1.0, 0.55, 0.1, 0.85 if b else 0.35)
 	_style_button(_boost_button, bg, 18)
 

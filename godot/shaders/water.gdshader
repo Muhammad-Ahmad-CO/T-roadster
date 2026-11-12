@@ -120,7 +120,8 @@ void fragment() {
 	// living edge, not a hard cut between water and sand.
 	float foam_band = smoothstep(56.0, 74.0, v_local.x);
 	float foam_pat = 0.5 + 0.5 * sin(v_local.z * 1.1 + TIME * 1.4 + sin(v_local.x * 1.7) * 2.5);
-	float foam = foam_band * pow(foam_pat, 3.0) * 0.55;
+	// Lane B: foam constant 0.55 -> 0.4 per the rebuild gate.
+	float foam = foam_band * pow(foam_pat, 3.0) * 0.4;
 	col = mix(col, vec3(0.9, 0.93, 0.95), foam);
 	// Distant horizon glow.
 	float horizon = smoothstep(-120.0, -230.0, v_local.z);

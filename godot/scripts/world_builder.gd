@@ -10,11 +10,12 @@ extends Node3D
 ## glow over the ocean on the LEFT, fake god-ray shafts, a wet road that
 ## catches the sunset, palms with individual drooping fronds and warm rim
 ## light, heat-haze shimmer above the asphalt, layered horizon haze,
-## emissive-window skyline, drifting clouds, ACES tone mapping + glow.
+## emissive-window skyline, drifting clouds, ACES tone mapping (glow OFF
+## — brightness compensation lives in _apply_palette / get_biome_palette).
 ## Everything is procedural and original — no imported art, no brands.
 ##
 ## Performance (Oppo F9, Android 8.1): shared materials everywhere,
-## one sun shadow-caster only (2048 map), low-poly props, recycled
+## one sun shadow-caster only (1024 map), low-poly props, recycled
 ## segments, and zero allocations in scroll() — the hot loop only moves
 ## existing nodes and reuses prebuilt arrays.
 
@@ -153,7 +154,10 @@ static func get_biome_palette(biome: String) -> Dictionary:
 				"sky_top": Color(0.13, 0.05, 0.32), "sky_horizon": Color(0.98, 0.40, 0.52),
 				"ground_bottom": Color(0.08, 0.06, 0.14), "ground_horizon": Color(0.22, 0.12, 0.24),
 				"sun_color": Color(1.0, 0.62, 0.38), "sun_energy": 1.7,
-				"fill_color": Color(1.0, 0.55, 0.42), "fill_energy": 0.38,
+				# Lane B glow-OFF compensation: fill 0.38 -> 0.50,
+				# palette dict only — _apply_palette overwrites
+				# build-time fill values on every biome change.
+				"fill_color": Color(1.0, 0.55, 0.42), "fill_energy": 0.50,
 				# Round 6 — fog cooled (R now below G: 0.33,0.35,0.43,
 				# was 0.38,0.36,0.43) and thinned (0.0022 -> 0.0018):
 				# the mid-road mauve (R-G ~40) is fog + grazing sky
@@ -210,6 +214,62 @@ func _box(size: Vector3, pos: Vector3, mat: Material) -> MeshInstance3D:
 	mi.position = pos
 	return mi
 
+# Merges primitive meshes into one ArrayMesh with one surface per
+# material. Each part is [mesh, transform, material_index]; the
+# transform is baked into the vertices (normals via the
+# inverse-transpose, so non-uniform squash stays correct). Only
+# vertex / normal / UV / index arrays are carried over — tangents
+# are dropped, because none of the merged materials uses a normal
+# map. Source meshes are never modified, so one BoxMesh can feed
+# many parts. Used by the Lane B cloud / guardrail / pole merges.
+func _merge_parts(parts: Array, materials: Array) -> ArrayMesh:
+	var group_count := materials.size()
+	var verts: Array = []
+	var normals: Array = []
+	var uvs: Array = []
+	var indices: Array = []
+	for g in range(group_count):
+		verts.append(PackedVector3Array())
+		normals.append(PackedVector3Array())
+		uvs.append(PackedVector2Array())
+		indices.append(PackedInt32Array())
+	for part in parts:
+		var src: Mesh = part[0]
+		var xform: Transform3D = part[1]
+		var gi: int = part[2]
+		var arrays: Array = src.surface_get_arrays(0)
+		var src_verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+		var src_normals: PackedVector3Array = arrays[Mesh.ARRAY_NORMAL]
+		var src_uvs: PackedVector2Array = arrays[Mesh.ARRAY_TEX_UV]
+		var src_indices: PackedInt32Array = arrays[Mesh.ARRAY_INDEX]
+		var base := (verts[gi] as PackedVector3Array).size()
+		var normal_xform := xform.basis.inverse().transposed()
+		var gv: PackedVector3Array = verts[gi]
+		var gn: PackedVector3Array = normals[gi]
+		var gu: PackedVector2Array = uvs[gi]
+		var gidx: PackedInt32Array = indices[gi]
+		for vi in range(src_verts.size()):
+			gv.append(xform * src_verts[vi])
+			gn.append((normal_xform * src_normals[vi]).normalized())
+			gu.append(src_uvs[vi] if vi < src_uvs.size() else Vector2.ZERO)
+		for idx in src_indices:
+			gidx.append(base + idx)
+		verts[gi] = gv
+		normals[gi] = gn
+		uvs[gi] = gu
+		indices[gi] = gidx
+	var out := ArrayMesh.new()
+	for g in range(group_count):
+		var out_arrays: Array = []
+		out_arrays.resize(Mesh.ARRAY_MAX)
+		out_arrays[Mesh.ARRAY_VERTEX] = verts[g]
+		out_arrays[Mesh.ARRAY_NORMAL] = normals[g]
+		out_arrays[Mesh.ARRAY_TEX_UV] = uvs[g]
+		out_arrays[Mesh.ARRAY_INDEX] = indices[g]
+		out.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, out_arrays)
+		out.surface_set_material(g, materials[g])
+	return out
+
 func _build_environment() -> void:
 	_sky_mat = ProceduralSkyMaterial.new()
 	_sky_mat.sky_top_color = _palette["sky_top"]
@@ -248,7 +308,14 @@ func _build_environment() -> void:
 	_environment.adjustment_saturation = 1.05
 	_environment.adjustment_contrast = 1.05
 	_environment.adjustment_brightness = 1.0
-	_environment.glow_enabled = true
+	# Lane B: glow OFF — the fullscreen blur passes are the most
+	# expensive effect on tile-based Mali GPUs. Brightness is
+	# compensated per-biome in _apply_palette (window emission,
+	# sun-disc energy, SunGlow alpha) plus the coastal fill lift in
+	# get_biome_palette. The intensity/strength/bloom values below
+	# are kept so the recorded fallback (glow for neon only) can be
+	# re-enabled from _apply_palette without re-tuning.
+	_environment.glow_enabled = false
 	_environment.glow_intensity = 0.25
 	_environment.glow_strength = 0.7
 	_environment.glow_bloom = 0.15
@@ -287,8 +354,12 @@ func _build_sun() -> void:
 	_sun.light_energy = float(_palette["sun_energy"])
 	_sun.shadow_enabled = true
 	_sun.directional_shadow_mode = DirectionalLight3D.SHADOW_ORTHOGONAL
-	_sun.directional_shadow_max_distance = 150.0
-	_sun.shadow_blur = 2.0
+	# Lane B shadow diet: max distance 150 -> 80 m, blur 2.0 -> 0
+	# (the shadow pass was ~54% of all draw calls). Opacity stays
+	# 0.3; rotation, colour and energy are unchanged. The 1024
+	# shadow-map size is Lane C's project.godot change.
+	_sun.directional_shadow_max_distance = 60.0
+	_sun.shadow_blur = 0.0
 	_sun.shadow_bias = 0.03
 	# Round 4: the hero's own shadow used to swallow the bottom third
 	# of the chase frame as a solid black slab. shadow_opacity 0.55
@@ -320,13 +391,16 @@ func _build_sun() -> void:
 	var disc_mat := ShaderMaterial.new()
 	disc_mat.shader = disc_shader
 	disc_mat.set_shader_parameter("disc_color", Color(1.0, 0.38, 0.08))
-	disc_mat.set_shader_parameter("energy", 0.8)
+	# Lane B glow-OFF compensation: build-time disc default energy
+	# 0.8 -> 2.5 (the per-biome value is set in _apply_palette) and
+	# radius 7 -> 10 m (height follows: a sphere needs 2x radius).
+	disc_mat.set_shader_parameter("energy", 2.5)
 	_sun_disc_mat = disc_mat
 	_sun_disc = MeshInstance3D.new()
 	_sun_disc.name = "SunDisc"
 	var disc_mesh := SphereMesh.new()
-	disc_mesh.radius = 7.0
-	disc_mesh.height = 14.0
+	disc_mesh.radius = 10.0
+	disc_mesh.height = 20.0
 	disc_mesh.radial_segments = 16
 	disc_mesh.rings = 8
 	disc_mesh.material = disc_mat
@@ -337,7 +411,7 @@ func _build_sun() -> void:
 	_sun_glow = Sprite3D.new()
 	_sun_glow.name = "SunGlow"
 	_sun_glow.texture = _make_radial_texture(256, Color(1.0, 0.45, 0.25), Color(1.0, 0.35, 0.55))
-	_sun_glow.modulate = Color(1.0, 0.7, 0.55, 0.45)
+	_sun_glow.modulate = Color(1.0, 0.7, 0.55, 0.6) # Lane B: alpha 0.45 -> 0.6 (glow-OFF compensation).
 	_sun_glow.pixel_size = 0.14
 	_sun_glow.position = Vector3(-54, 33, -232)
 	_sun_glow.billboard = BaseMaterial3D.BILLBOARD_ENABLED
@@ -386,6 +460,8 @@ func _build_ground() -> void:
 	ground_mesh.material = _ground_mat
 	_ground.mesh = ground_mesh
 	_ground.position = Vector3(107, -0.15, -110)
+	# Lane B: ground planes cast no visible shadow — OFF.
+	_ground.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_ground)
 	# Warm sand strip between the road's left shoulder and the water.
 	# NARROW (8 m, x=-14..-6): the old 16 m strip pushed the waterline
@@ -403,6 +479,7 @@ func _build_ground() -> void:
 	sand_mesh.material = _sand_mat
 	_sand.mesh = sand_mesh
 	_sand.position = Vector3(-10, -0.08, -110)
+	_sand.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_sand)
 
 func _build_ocean() -> void:
@@ -413,7 +490,12 @@ func _build_ocean() -> void:
 	_ocean_mat.set_shader_parameter("shallow_color", Color(0.10, 0.42, 0.72))
 	_ocean_mat.set_shader_parameter("sunset_color", Color(1.0, 0.45, 0.62))
 	_ocean_mat.set_shader_parameter("sky_tint", Color(0.55, 0.25, 0.55))
-	_ocean_mat.set_shader_parameter("sun_direction", Vector3(0.05, 0.28, -0.96))
+	# Lane B: sun_direction now matches the true sun direction
+	# (-0.23, 0.14, -0.96) — the direction FROM the fragment TO the
+	# sun, as water.gdshader uses it (dot(reflect(-view, n),
+	# sun_dir)): -X = toward the disc over the ocean, +Y = above
+	# the horizon. The old (0.05, 0.28, -0.96) pointed right/up.
+	_ocean_mat.set_shader_parameter("sun_direction", Vector3(-0.23, 0.14, -0.96))
 	_ocean_mat.set_shader_parameter("wave_height", 0.35)
 	_ocean_mat.set_shader_parameter("wave_speed", 1.1)
 	_ocean_mat.set_shader_parameter("glitter_strength", 0.8) # R8: 1.0 -> 0.8 (hero glitter corridor still broad/bright)
@@ -434,6 +516,9 @@ func _build_ocean() -> void:
 	# toward the shore inside the shader so they never poke through
 	# the sand; the shader also draws animated foam at the waterline.
 	_ocean.position = Vector3(-90.5, -0.12, -175)
+	# Lane B: the ocean is 9,506 tris in the shadow pass and shadows
+	# nothing visible — OFF. Subdivision is unchanged (gate cut).
+	_ocean.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_ocean)
 
 func _build_road() -> void:
@@ -457,27 +542,45 @@ func _build_road() -> void:
 		seg_mesh.material = _road_mat
 		seg.mesh = seg_mesh
 		seg.position = Vector3(0, -0.06, z)
+		# Lane B: road segments + shoulders are flush with the
+		# ground and shadow nothing visible — OFF.
+		seg.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		_scroll_root.add_child(seg)
 		_road_segments.append(seg)
 		for side in [-1, 1]:
 			var shoulder := _box(Vector3(1.2, 0.1, SEGMENT_LEN), Vector3(side * 6.6, -0.05, z), shoulder_mat)
 			shoulder.name = "Shoulder%d" % i
+			shoulder.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 			_scroll_root.add_child(shoulder)
 			_road_segments.append(shoulder)
 
 func _build_guardrails() -> void:
 	_rail_mat = _std(Color(0.7, 0.72, 0.75), 0.7, 0.45)
 	var post_mat := _std(Color(0.25, 0.26, 0.28), 0.6, 0.5)
+	# Lane B merge: one MeshInstance (2 surfaces: rail + posts) per
+	# segment instead of 10 separate boxes — 12 instances / 24
+	# surfaces instead of 120 / 120. Box sizes, positions and
+	# materials are exactly the old ones; the Guard%d group nodes
+	# (moved by scroll()) are unchanged, and guardrails keep
+	# casting shadows.
+	var rail_mesh := BoxMesh.new()
+	rail_mesh.size = Vector3(0.08, 0.28, SEGMENT_LEN)
+	var post_mesh := BoxMesh.new()
+	post_mesh.size = Vector3(0.12, 0.8, 0.12)
 	for i in range(SEGMENT_COUNT):
 		var z := FAR_Z + float(i) * SEGMENT_LEN + SEGMENT_LEN * 0.5
 		var group := Node3D.new()
 		group.name = "Guard%d" % i
 		group.position = Vector3(0, 0, z)
+		var parts: Array = []
 		for side in [-1, 1]:
-			var rail := _box(Vector3(0.08, 0.28, SEGMENT_LEN), Vector3(side * 7.4, 0.75, 0), _rail_mat)
-			group.add_child(rail)
+			parts.append([rail_mesh, Transform3D(Basis(), Vector3(side * 7.4, 0.75, 0)), 0])
 			for pz in [-7.5, -2.5, 2.5, 7.5]:
-				group.add_child(_box(Vector3(0.12, 0.8, 0.12), Vector3(side * 7.4, 0.4, pz), post_mat))
+				parts.append([post_mesh, Transform3D(Basis(), Vector3(side * 7.4, 0.4, pz)), 1])
+		var merged := MeshInstance3D.new()
+		merged.name = "GuardMesh%d" % i
+		merged.mesh = _merge_parts(parts, [_rail_mat, post_mat])
+		group.add_child(merged)
 		_scroll_root.add_child(group)
 		_guard_segments.append(group)
 
@@ -489,29 +592,61 @@ func _build_poles() -> void:
 	_pole_lamp_mat.emission = Color(1.0, 0.8, 0.5)
 	_pole_lamp_mat.emission_energy_multiplier = 2.5
 	var pole_count := int(WORLD_SPAN / POLE_SPACING)
+	# Lane B merge: one MeshInstance (2 surfaces: pole + lamp) per
+	# pole instead of 3 boxes — 6 instances / 12 surfaces instead
+	# of 18 / 18. Sizes, positions and materials are exactly the
+	# old ones; the Pole%d group nodes (moved by scroll()) are
+	# unchanged, and poles keep casting shadows. The old "LampHead"
+	# child node is gone (no code referenced it — the lamp is now
+	# the second surface of the merged mesh).
+	var pole_mesh := BoxMesh.new()
+	pole_mesh.size = Vector3(0.22, 7.5, 0.22)
+	var arm_mesh := BoxMesh.new()
+	arm_mesh.size = Vector3(2.4, 0.18, 0.18)
+	var head_mesh := BoxMesh.new()
+	head_mesh.size = Vector3(0.7, 0.14, 0.3)
 	for i in range(pole_count):
 		var z := FAR_Z + float(i) * POLE_SPACING + POLE_SPACING * 0.5
 		var side := -1.0 if i % 2 == 0 else 1.0
 		var group := Node3D.new()
 		group.name = "Pole%d" % i
 		group.position = Vector3(0, 0, z)
-		group.add_child(_box(Vector3(0.22, 7.5, 0.22), Vector3(side * 7.0, 3.75, 0), pole_mat))
-		var arm := _box(Vector3(2.4, 0.18, 0.18), Vector3(side * 5.9, 7.4, 0), pole_mat)
-		group.add_child(arm)
-		var head := _box(Vector3(0.7, 0.14, 0.3), Vector3(side * 4.8, 7.3, 0), _pole_lamp_mat)
-		head.name = "LampHead"
-		group.add_child(head)
+		var parts: Array = [
+			[pole_mesh, Transform3D(Basis(), Vector3(side * 7.0, 3.75, 0)), 0],
+			[arm_mesh, Transform3D(Basis(), Vector3(side * 5.9, 7.4, 0)), 0],
+			[head_mesh, Transform3D(Basis(), Vector3(side * 4.8, 7.3, 0)), 1],
+		]
+		var merged := MeshInstance3D.new()
+		merged.name = "PoleMesh%d" % i
+		merged.mesh = _merge_parts(parts, [pole_mat, _pole_lamp_mat])
+		group.add_child(merged)
 		_scroll_root.add_child(group)
 		_pole_segments.append(group)
 
 func _build_palms() -> void:
 	for i in range(PALM_COUNT):
 		var palm := _Vehicles.build_palm()
-		_place_palm(palm, FAR_Z + _rng.randf() * WORLD_SPAN)
+		# Lane B near-palm guarantee: the first three palms are
+		# placed in the near field (z -20..-60, one per band) so
+		# every run has palms beside the road near the camera.
+		# Initial placement ONLY — scroll()/recycling is untouched.
+		# Palm 0 is forced to the sand strip (always in frame),
+		# palm 1 to the land side, palm 2 takes a random side.
+		var z := FAR_Z + _rng.randf() * WORLD_SPAN
+		var side := -1
+		if i == 0:
+			z = _rng.randf_range(-30.0, -20.0)
+			side = 1
+		elif i == 1:
+			z = _rng.randf_range(-45.0, -30.0)
+			side = 0
+		elif i == 2:
+			z = _rng.randf_range(-60.0, -45.0)
+		_place_palm(palm, z, side)
 		_scroll_root.add_child(palm)
 		_palm_nodes.append(palm)
 
-func _place_palm(palm: Node3D, z: float) -> void:
+func _place_palm(palm: Node3D, z: float, force_side: int = -1) -> void:
 	# Ocean side gets the taller, wind-bent palms; the land side gets
 	# shorter, fuller ones. Keep clear of the road and guardrails.
 	# Round 7 — more palms, biased to the LAND side (left 0.45, was
@@ -521,6 +656,15 @@ func _place_palm(palm: Node3D, z: float) -> void:
 	# (0.85..1.35, was 0.7..1.15) so the verge reads as planted
 	# roadside, not desert.
 	var left := _rng.randf() < 0.45
+	# Lane B: initial placement may force a side (1 = sand strip,
+	# 0 = land side); recycling calls pass no side and keep the
+	# random draw above. The x-bounds below are unchanged, so a
+	# forced palm still lands on sand or verge — never in the sea
+	# or on the road.
+	if force_side == 1:
+		left = true
+	elif force_side == 0:
+		left = false
 	var x: float
 	if left:
 		# Beach strip only: x=-14 is the waterline, so palms must stay
@@ -664,6 +808,12 @@ func _build_skyline() -> void:
 			_skyline.add_child(_box(Vector3(0.6, 1.0, 0.6), Vector3(x + w * 0.5, h + 0.5 - 1.0, tz), _window_mat))
 		x += w + _rng.randf_range(2.0, 9.0)
 		tower_i += 1
+	# Lane B: the skyline sits 200+ m away, beyond the 80 m shadow
+	# range, and its silhouette shadows nothing visible — every
+	# tower / window / beacon / rooftop box stops casting.
+	for child in _skyline.get_children():
+		if child is MeshInstance3D:
+			(child as MeshInstance3D).cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 
 func _build_clouds() -> void:
 	# Three depth layers (far/low near the horizon, mid, near/high),
@@ -708,23 +858,29 @@ func _build_clouds() -> void:
 		mat.albedo_color.a = _rng.randf_range(0.35, 0.9)
 		var cloud := Node3D.new()
 		cloud.name = "Cloud%d" % i
+		# Lane B merge: the lit puffs and the underside puffs are
+		# baked into ONE ArrayMesh with 2 surfaces (lit + under)
+		# instead of one MeshInstance per puff — 14 instances / 28
+		# surfaces instead of ~102 / ~102. Puff counts, radii,
+		# positions and squashes are drawn in exactly the old order
+		# with the old parameters, so each cloud keeps its shape;
+		# only the node-per-puff overhead is gone. Clouds never
+		# cast shadows.
+		var lit_parts: Array = []
 		var puffs := 3 + _rng.randi_range(0, 3)
 		var size_boost := 1.0 + float(layer) * 0.3
 		for p in range(puffs):
-			var puff := MeshInstance3D.new()
 			var puff_mesh := SphereMesh.new()
 			puff_mesh.radius = _rng.randf_range(4.0, 9.0) * size_boost
 			puff_mesh.height = puff_mesh.radius * 1.1
 			puff_mesh.radial_segments = 10
 			puff_mesh.rings = 6
-			puff_mesh.material = mat
-			puff.mesh = puff_mesh
 			# Vertical squash VARIES per puff (0.35..0.6) and puffs sit
 			# at different heights (-1.5..+2.2) so the cloud has a
 			# domed top instead of one flat row of identical ellipses.
-			puff.position = Vector3(float(p) * _rng.randf_range(5.0, 8.0) - 8.0, _rng.randf_range(-1.5, 2.2), _rng.randf_range(-2.0, 2.0))
-			puff.scale = Vector3(1.6, _rng.randf_range(0.35, 0.6), 1.0)
-			cloud.add_child(puff)
+			var puff_pos := Vector3(float(p) * _rng.randf_range(5.0, 8.0) - 8.0, _rng.randf_range(-1.5, 2.2), _rng.randf_range(-2.0, 2.0))
+			var puff_scale := Vector3(1.6, _rng.randf_range(0.35, 0.6), 1.0)
+			lit_parts.append([puff_mesh, Transform3D(Basis.from_scale(puff_scale), puff_pos), 0])
 		# Round 4 — dark purple-grey UNDERSIDE: a second, lower layer
 		# of smaller puffs hanging under the lit top, so each cloud
 		# reads as a volume with a shadowed belly instead of a flat
@@ -734,19 +890,25 @@ func _build_clouds() -> void:
 		under_mat.albedo_color = Color(0.42, 0.30, 0.52, _rng.randf_range(0.4, 0.6))
 		under_mat.emission = Color(0.30, 0.20, 0.42)
 		under_mat.emission_energy_multiplier = 0.12
+		var under_parts: Array = []
 		var under_puffs := 2 + _rng.randi_range(0, 2)
 		for u in range(under_puffs):
-			var up := MeshInstance3D.new()
 			var up_mesh := SphereMesh.new()
 			up_mesh.radius = _rng.randf_range(3.0, 6.5) * size_boost
 			up_mesh.height = up_mesh.radius * 1.1
 			up_mesh.radial_segments = 10
 			up_mesh.rings = 6
-			up_mesh.material = under_mat
-			up.mesh = up_mesh
-			up.position = Vector3(float(u) * _rng.randf_range(5.0, 8.0) - 6.0, _rng.randf_range(-3.2, -1.8), _rng.randf_range(-1.5, 1.5))
-			up.scale = Vector3(1.6, _rng.randf_range(0.3, 0.45), 1.0)
-			cloud.add_child(up)
+			var up_pos := Vector3(float(u) * _rng.randf_range(5.0, 8.0) - 6.0, _rng.randf_range(-3.2, -1.8), _rng.randf_range(-1.5, 1.5))
+			var up_scale := Vector3(1.6, _rng.randf_range(0.3, 0.45), 1.0)
+			under_parts.append([up_mesh, Transform3D(Basis.from_scale(up_scale), up_pos), 1])
+		var parts: Array = []
+		parts.append_array(lit_parts)
+		parts.append_array(under_parts)
+		var merged := MeshInstance3D.new()
+		merged.name = "CloudMesh%d" % i
+		merged.mesh = _merge_parts(parts, [mat, under_mat])
+		merged.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		cloud.add_child(merged)
 		# Far layer hugs the horizon, near layer rides higher — the
 		# perspective reads as real depth instead of one flat row.
 		cloud.position = Vector3(px, 28.0 + float(layer) * 6.0 + _rng.randf_range(0.0, 10.0), layer_z[layer] + _rng.randf_range(-12.0, 12.0))
@@ -765,8 +927,9 @@ func _build_stars() -> void:
 	# Fog is DISABLED on the material: at ~250 m even the thin neon
 	# fog would wash the points out toward the fog colour (the same
 	# reason the sun disc shader is fog_disabled). Unshaded + vertex
-	# colours carry the varied brightness; the global glow softens
-	# the brightest points slightly, like real star glare.
+	# colours carry the varied brightness; with glow OFF the
+	# brightest points render as hard points (no bloom) and the
+	# brightness variation still reads as glare.
 	# Sizes: at ~250 m the chase camera resolves ~4.6 px/m at 720p,
 	# so 0.36..1.0 m quads read as 2..5 px points — stars, not
 	# noise. A few larger bright stars anchor the field. Low stars
@@ -835,6 +998,8 @@ func _build_stars() -> void:
 	_stars.name = "Stars"
 	_stars.mesh = star_mesh
 	_stars.visible = false
+	# Lane B: star quads hang in the sky and shadow nothing — OFF.
+	_stars.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_stars)
 
 func _build_shafts() -> void:
@@ -860,6 +1025,8 @@ func _build_shafts() -> void:
 		shaft_mesh.material = _shaft_mat.duplicate() as StandardMaterial3D
 		shaft.mesh = shaft_mesh
 		shaft.position = Vector3(-32.0 + float(i) * 9.0, 16.0, -120.0 - float(i) * 18.0)
+		# Lane B: translucent light shafts shadow nothing — OFF.
+		shaft.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		shaft.rotation_degrees = Vector3(8, 28, 24)
 		shaft.set_meta("phase", float(i) * 1.7)
 		add_child(shaft)
@@ -878,6 +1045,8 @@ func _build_haze() -> void:
 	haze_mesh.material = _haze_mat
 	_haze_plane.mesh = haze_mesh
 	_haze_plane.position = Vector3(0, 0.6, -45)
+	# Lane B: haze planes shadow nothing — OFF.
+	_haze_plane.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_haze_plane)
 	# Distant haze band: a wide translucent ribbon hugging the horizon
 	# so the skyline melts into the sunset instead of ending in a hard cut.
@@ -896,6 +1065,7 @@ func _build_haze() -> void:
 	band_mesh.material = band_mat
 	band.mesh = band_mesh
 	band.position = Vector3(0, 5, -248)
+	band.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(band)
 
 # ---------------------------------------------------------------- runtime
@@ -944,11 +1114,12 @@ func set_biome(biome: String) -> void:
 
 func _apply_palette() -> void:
 	var p := _palette
-	# Spec-gap pass — the star field is neon-only (the TEST SITE
-	# intro forces neon, and SPEC §2.5 calls that night "dark,
-	# starry"). Hidden in every other biome, so those skies render
-	# exactly as before; the node is never in the scroll root, so
-	# world recycling cannot move or duplicate the stars.
+	# The star field is neon-only (SPEC §2.5 calls the neon night
+	# "dark, starry"). Hidden in every other biome, so those skies
+	# render exactly as before; the node is never in the scroll
+	# root, so world recycling cannot move or duplicate the stars.
+	# (The TEST SITE intro no longer forces neon — Lane C decouples
+	# it — but the stars stay tied to the neon biome itself.)
 	_stars.visible = _biome == "neon"
 	_sky_mat.sky_top_color = p["sky_top"]
 	_sky_mat.sky_horizon_color = p["sky_horizon"]
@@ -961,6 +1132,21 @@ func _apply_palette() -> void:
 	# The sun disc follows the biome's sun: orange on the coast,
 	# pink in neon, pale in the desert, white in the snow.
 	_sun_disc_mat.set_shader_parameter("disc_color", p["sun_color"] if _biome != "coastal" else Color(1.0, 0.38, 0.08))
+	# Lane B glow-OFF compensation: disc energy is per-biome HERE
+	# (this runs on every biome change and overwrites the
+	# build-time default): coastal 2.5, neon 1.2, desert/canyon
+	# 2.0, snow 1.5, rain 1.0.
+	var disc_energy := 2.5
+	match _biome:
+		"neon":
+			disc_energy = 1.2
+		"desert", "canyon":
+			disc_energy = 2.0
+		"snow":
+			disc_energy = 1.5
+		"rain":
+			disc_energy = 1.0
+	_sun_disc_mat.set_shader_parameter("energy", disc_energy)
 	_environment.ambient_light_color = p["ambient_color"]
 	_environment.fog_light_color = p["fog_color"]
 	_environment.fog_density = float(p["fog_density"])
@@ -969,6 +1155,9 @@ func _apply_palette() -> void:
 	_road_mat.set_shader_parameter("asphalt_color", p["road_color"])
 	_road_mat.set_shader_parameter("sun_tint", p["haze_color"])
 	_haze_mat.set_shader_parameter("haze_color", p["haze_color"])
+	# Lane B glow-OFF compensation: window emission is raised per
+	# biome in the match below (neon 5.0, snow 1.2, coastal/rain
+	# 0.6); canyon/desert leave it unset as before (skyline hidden).
 	# Prop sets per biome — ocean only where there is a sea, palms only
 	# where trees grow, skyline only where a city makes sense.
 	match _biome:
@@ -982,7 +1171,7 @@ func _apply_palette() -> void:
 			_ground_mat.albedo_color = Color(0.15, 0.14, 0.18)
 			for palm in _palm_nodes:
 				palm.visible = true
-			_window_mat.emission_energy_multiplier = 0.5
+			_window_mat.emission_energy_multiplier = 0.6
 			# Round 7 — additive sun streak: full warm sunset path.
 			_road_mat.set_shader_parameter("streak_strength", 1.0)
 			_road_mat.set_shader_parameter("streak_color", Color(1.0, 0.45, 0.18))
@@ -993,7 +1182,7 @@ func _apply_palette() -> void:
 			_ground_mat.albedo_color = Color(0.22, 0.17, 0.19)
 			for palm in _palm_nodes:
 				palm.visible = true
-			_window_mat.emission_energy_multiplier = 0.5
+			_window_mat.emission_energy_multiplier = 0.6
 			# Rain: a dimmer, pinker streak — the wet night road
 			# still catches the sunset, but a full warm path would
 			# bring back the pink left-lane wash Round 6 killed.
@@ -1006,7 +1195,7 @@ func _apply_palette() -> void:
 			_ground_mat.albedo_color = Color(0.22, 0.17, 0.19)
 			for palm in _palm_nodes:
 				palm.visible = true
-			_window_mat.emission_energy_multiplier = 4.0
+			_window_mat.emission_energy_multiplier = 5.0
 			_road_mat.set_shader_parameter("streak_strength", 0.6)
 			_road_mat.set_shader_parameter("streak_color", Color(1.0, 0.4, 0.8))
 		"canyon", "desert":
@@ -1025,7 +1214,7 @@ func _apply_palette() -> void:
 			for palm in _palm_nodes:
 				palm.visible = false
 			_ground_mat.albedo_color = Color(0.8, 0.82, 0.88)
-			_window_mat.emission_energy_multiplier = 1.0
+			_window_mat.emission_energy_multiplier = 1.2
 			# Snow: a faint WHITE streak only — the sun is white
 			# here, so a warm orange path would read as dirt.
 			_road_mat.set_shader_parameter("streak_strength", 0.3)

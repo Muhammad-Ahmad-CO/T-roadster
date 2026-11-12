@@ -26,5 +26,7 @@ pointing/emulate_touch_from_mouse=true
 
 renderer/rendering_method="mobile"
 renderer/rendering_method.mobile="gl_compatibility"
+lights_and_shadows/directional_shadow/size=1024
+lights_and_shadows/directional_shadow/size.mobile=1024
 textures/vram_compression/import_etc2_astc=true
 environment/defaults/default_clear_color=Color(0.09, 0.05, 0.16, 1)
