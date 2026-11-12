@@ -6,6 +6,9 @@ varying float v_spec;
 // cycles per segment and cannot tell near from far; world Z can).
 // Used for the streak distance fade and the grain amplitude ramp.
 varying float v_wz;
+// Smoothed base colour (pre-texture asphalt + palette tints + markings,
+// no texture/grain) for the light() chroma test — GATE R5 Step 2.
+varying vec3 v_base_col;
 
 void vertex() {
 	v_wz = (MODEL_MATRIX * vec4(VERTEX, 1.0)).z;
@@ -24,6 +27,14 @@ void vertex() {
 // while the specular sun streak keeps its warm colour, and the yellow
 // centre dashes keep their warm light. The near-field checkerboard
 // (old per-cell hash, 240x1600 cells) is replaced by smooth value noise.
+//
+// Cinematic rebuild (GATE R5 Step 2) — Asphalt031 texture: the road
+// samples res://assets/asphalt031_color_1024.jpg for mean-preserving
+// luminance detail (4 x 6 tiles per segment, from RAW uv) and
+// res://assets/asphalt031_rough_512.jpg for roughness variation.
+// Markings/dashes/streak composite OVER the textured albedo and stay
+// crisp; light() chroma weight derives from the smoothed (pre-texture)
+// base colour via v_base_col, so aggregate grain cannot flicker it.
 
 uniform vec4 asphalt_color : source_color = vec4(0.10, 0.10, 0.12, 1.0);
 uniform vec4 line_color : source_color = vec4(0.92, 0.90, 0.82, 1.0);
@@ -38,7 +49,10 @@ uniform float dash_count = 2.0;
 // How much of the warm direct light is desaturated out of the grey
 // asphalt toward neutral grey (0 = keep the sunset orange, 1 = fully
 // grey diffuse). The warm sun STREAK is specular and is NOT touched.
-uniform float light_desat = 1.0;
+// Cinematic rebuild (GATE R5 Step 1): 1.0 -> 0.55 — the reel road is
+// warm mauve, not neutral grey; the R5-R8 grey target is superseded.
+// Falsifier: road goes orange-brown -> restore desat in 0.1 steps.
+uniform float light_desat = 0.55;
 // Round 7 — ADDITIVE sun streak (a separate mechanism from the GGX
 // term): the GGX streak could never be made bold without warming the
 // whole road (boost 2.5/6.0 and wider bands all failed in Round 6),
@@ -71,6 +85,29 @@ uniform float specular_boost = 0.10; // R7: 1.5 -> 0.4. R8: 0.4 -> 0.25 -> 0.10 
 // reflection at grazing angles. Rain sets this low (0.4) so the wet
 // road stops mirroring the pink sky on the left lane.
 uniform float reflection_scale = 1.0;
+// Cinematic rebuild (GATE R5 Step 2): Asphalt031 maps, set once from
+// world_builder._build_road (_apply_palette never touches them, so
+// they survive biome changes). Linear + mipmap filtering, repeat
+// wrapping: the tiling below relies on repeat at segment edges.
+// (Godot 4.3 rejects the `repeat` sampler hint — "Expected valid
+// type hint" — so only the filter hint is declared; repeat is the
+// RenderingServer default sampler behaviour, verified by the seam
+// check: clamp wrapping would stretch one tile over the segment.)
+uniform sampler2D asphalt_tex : filter_linear_mipmap;
+uniform sampler2D asphalt_rough_tex : filter_linear_mipmap;
+// Measured mean luminance of asphalt031_color_1024.jpg in the space
+// the shader actually samples: Godot 4.3 does NOT sRGB-decode this
+// VRAM-compressed texture in a custom shader — texture() returns the
+// raw sRGB values (proven by render: the linear-space mean 0.195
+// brightened the road ~1.5x, clamped; the sRGB mean restores Stage 5
+// brightness). tex_mod = lum / this averages 1.0, so the texture
+// adds ONLY luminance detail around the palette road_color.
+const float TEX_MEAN_LUM = 0.471;
+// Texture detail strength: full-strength modulation would swing the
+// road 0.54x-1.72x (measured p5/p95 of the map) — 3x the old grain
+// amplitude. 0.4 keeps the aggregate visible near the camera; the
+// remap stays mean-preserving at any strength.
+const float TEX_STRENGTH = 0.4;
 
 float hash21(vec2 p) {
 	vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -124,13 +161,32 @@ void fragment() {
 	// up close — smooth noise + low near amplitude cannot alias into
 	// it), stronger (+/-14%) in the mid/far road where the texture
 	// needs to read. All three octaves are SMOOTH value noise, no
-	// hard cell edges anywhere.
-	float g1 = vnoise(uv * vec2(24.0, 40.0)); // ~0.5 m blotches
-	float g2 = vnoise(uv * vec2(90.0, 150.0)); // ~0.13 m fine grain
-	float g3 = vnoise(uv * vec2(6.0, 10.0)); // ~2 m patches
-	float grain = g1 * 0.45 + g2 * 0.30 + g3 * 0.25;
-	float gamp = mix(0.06, 0.14, smoothstep(-8.0, -50.0, v_wz));
-	vec3 col = asphalt_color.rgb * (1.0 + (grain - 0.5) * 2.0 * gamp);
+	// hard cell edges anywhere. (Cinematic rebuild, GATE R5 Step 2:
+// superseded by the Asphalt031 texture below — g1/g3 dropped, one
+// fine octave kept for close-up detail.)
+	// Cinematic rebuild (GATE R5 Step 2) — Asphalt031 texture.
+	// tex_uv uses the RAW mesh uv, NOT `across`: asphalt is isotropic,
+	// so the R8 BoxMesh mirror flip is invisible in the texture, and
+	// sampling raw uv keeps the tiling phase identical on every
+	// segment. 4 tiles across the 12 m road, 6 along the 20 m segment
+	// — INTEGER per segment in both axes, so the texture phase matches
+	// at recycle seams (a segment recycled by -240 m is
+	// indistinguishable from the one it replaces). `across` stays for
+	// markings/streak only; dash/marking UVs are untouched.
+	vec2 tex_uv = vec2(uv.x * 4.0, uv.y * 6.0);
+	vec3 tex_sample = texture(asphalt_tex, tex_uv).rgb;
+	float tex_lum = dot(tex_sample, vec3(0.299, 0.587, 0.114));
+	// Mean-preserving luminance detail: tex_mod averages 1.0, so the
+	// palette road_color keeps control of hue/brightness. Clamped so
+	// the darkest/brightest texels cannot punch through.
+	float tex_mod = clamp(1.0 + (tex_lum / TEX_MEAN_LUM - 1.0) * TEX_STRENGTH, 0.6, 1.5);
+	vec3 col = asphalt_color.rgb * tex_mod;
+	// One fine noise octave kept (g1/g3 dropped — the texture carries
+	// mid/far detail): close-up aggregate shimmer only, fading out
+	// by 50 m so it never aliases at distance.
+	float fine = vnoise(uv * vec2(90.0, 150.0));
+	float fine_amp = mix(0.06, 0.0, smoothstep(-8.0, -50.0, v_wz));
+	col *= 1.0 + (fine - 0.5) * 2.0 * fine_amp;
 
 	// Tyre-wear bands: darker polished strips at each lane centre
 	// (lane centres at 1/8, 3/8, 5/8, 7/8 of the road width).
@@ -179,14 +235,17 @@ void fragment() {
 	// the warm path keeps its colour and gains CONTRAST against the
 	// now-cooler far road. Kept modest (0.25) so the far road reads
 	// as cool grey asphalt in sunset haze, not blue paint.
-	float far_cool = smoothstep(-30.0, -120.0, v_wz) * 0.25;
+	// Cinematic rebuild (GATE R5 Step 1): 0.25 -> 0.15 (warmer far road).
+	float far_cool = smoothstep(-30.0, -120.0, v_wz) * 0.15;
 	col = mix(col, col * vec3(0.78, 0.88, 1.08), far_cool);
 
 	// Round 6 — left-cool counter-tint strengthened (0.30 -> 0.45)
 	// and cooled further: the fog + grazing sky reflection still
 	// leave the road mauve (mid-road R-G ~40), so the counter-tint
 	// has to work harder on the sun side.
-	float left_cool = smoothstep(0.45, 0.05, across) * 0.45;
+	// Cinematic rebuild (GATE R5 Step 1): 0.45 -> 0.20 (the reel road
+	// IS warm mauve; the counter-tint now only takes the edge off).
+	float left_cool = smoothstep(0.45, 0.05, across) * 0.20;
 	col = mix(col, col * vec3(0.72, 0.85, 1.12), left_cool);
 
 	// Round 8 — right-cool counter-tint, mirroring the left-cool
@@ -196,8 +255,24 @@ void fragment() {
 	// as the left side so both lanes match. Starts at across 0.55
 	// so it never touches the streak band (centre 0.42, feather
 	// to 0.48) or the centre dashes.
-	float right_cool = smoothstep(0.55, 0.95, across) * 0.45;
+	// Cinematic rebuild (GATE R5 Step 1): 0.45 -> 0.20 (matches left).
+	float right_cool = smoothstep(0.55, 0.95, across) * 0.20;
 	col = mix(col, col * vec3(0.72, 0.85, 1.12), right_cool);
+
+	// Smoothed base colour for light(): the SAME wear/marking/edge/tint
+	// pipeline as `col` but WITHOUT the texture modulation and fine
+	// grain, so the desaturation weight w does not vary per-texel with
+	// the asphalt aggregate (GATE R5 Step 2). Markings stay in, so
+	// dashes keep their warm-light behaviour exactly as in v2.1.0.
+	vec3 smooth_col = asphalt_color.rgb;
+	smooth_col = mix(smooth_col, wear_color.rgb, wear * 0.45);
+	smooth_col = mix(smooth_col, dash_col, lane_line * dash_on);
+	smooth_col = mix(smooth_col, line_color.rgb, edge);
+	smooth_col = mix(smooth_col, sun_tint.rgb, clamp(wet_glow, 0.0, 1.0) * 0.02);
+	smooth_col = mix(smooth_col, smooth_col * vec3(0.78, 0.88, 1.08), far_cool);
+	smooth_col = mix(smooth_col, smooth_col * vec3(0.72, 0.85, 1.12), left_cool);
+	smooth_col = mix(smooth_col, smooth_col * vec3(0.72, 0.85, 1.12), right_cool);
+	v_base_col = smooth_col;
 
 	ALBEDO = col;
 	// Round 6 — dry SPECULAR 0.002 -> 0.001 (the grazing sky
@@ -209,7 +284,12 @@ void fragment() {
 	// the mid-distance while fewer near-road pixels sit in it.
 	float wet_band = 1.0 - smoothstep(0.06, 0.14, abs(across - 0.42));
 	float wet_factor = clamp(wet_band * wetness * 1.2, 0.0, 1.0);
-	ROUGHNESS = mix(0.95, 0.25, wet_factor);
+	// Cinematic rebuild (GATE R5 Step 2): roughness map (R channel,
+	// same tiling) blended into the dry roughness BEFORE the wet-band
+	// mix, so the wet band still overrides toward glossy.
+	float rough_tex = texture(asphalt_rough_tex, tex_uv).r;
+	float dry_rough = mix(0.95, rough_tex, 0.6);
+	ROUGHNESS = mix(dry_rough, 0.25, wet_factor);
 	SPECULAR = mix(0.001, 0.24, wet_factor) * reflection_scale;
 	METALLIC = 0.0;
 	v_spec = SPECULAR;
@@ -281,7 +361,10 @@ void light() {
 	// Grey asphalt (low albedo chroma) gets the full desaturation;
 	// coloured markings (high chroma, e.g. the yellow centre line)
 	// keep their warm light so the dashes stay yellow, not grey.
-	float spread = max(ALBEDO.r, max(ALBEDO.g, ALBEDO.b)) - min(ALBEDO.r, min(ALBEDO.g, ALBEDO.b));
+	// Cinematic rebuild (GATE R5 Step 2): the chroma test runs on the
+	// SMOOTHED base colour (v_base_col), NOT the textured albedo, so
+	// aggregate grain cannot make w flicker per-texel.
+	float spread = max(v_base_col.r, max(v_base_col.g, v_base_col.b)) - min(v_base_col.r, min(v_base_col.g, v_base_col.b));
 	float w = (1.0 - smoothstep(0.04, 0.18, spread)) * light_desat;
 	float lum = dot(diffuse, vec3(0.299, 0.587, 0.114));
 	DIFFUSE_LIGHT += mix(diffuse, vec3(lum), w);

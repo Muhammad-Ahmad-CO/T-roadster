@@ -30,6 +30,19 @@ const RECYCLE_Z := 15.0
 const FAR_Z := -225.0
 const PALM_COUNT := 34
 const POLE_SPACING := 40.0
+# Cinematic rebuild (follow-up: near-camera intrusion at the Lane C R8
+# camera, z=20, FOV 64): poles/palms recycle well BEFORE the camera
+# plane. The old thresholds let poles reach z=35 (15 m BEHIND the
+# camera) and palms z=15 (5 m ahead), so poles loomed huge and clipped
+# at the frame edges and palm crowns intruded at the corners (proven
+# in lane-c R8 renders + lane-b/newcam-before_*.png). -10 keeps every
+# pole/palm >= 30 m ahead of the z=20 camera. Count/spacing/density
+# are unchanged: the recycle window just shifts 25-45 m forward, and
+# subtracting WORLD_SPAN (6x the pole spacing) keeps the pole lattice.
+# Road/guard segments keep RECYCLE_Z: the road edge must extend under
+# the camera, and guards are low roadside geometry, not looming.
+const POLE_RECYCLE_Z := -10.0
+const PALM_RECYCLE_Z := -10.0
 const CLOUD_COUNT := 14
 
 var _biome := "coastal"
@@ -43,7 +56,12 @@ var _sun: DirectionalLight3D
 var _fill: DirectionalLight3D
 var _sun_disc: MeshInstance3D
 var _sun_disc_mat: ShaderMaterial
-var _sun_glow: Sprite3D
+var _sun_halo: MeshInstance3D
+var _sun_halo2: MeshInstance3D
+var _sun_halo_mat: StandardMaterial3D
+var _sun_halo2_mat: StandardMaterial3D
+var _halo_tex: Texture2D
+var _lamp_halo_mat: StandardMaterial3D
 
 var _scroll_root: Node3D
 var _road_segments: Array[Node3D] = []
@@ -147,25 +165,27 @@ static func get_biome_palette(biome: String) -> Dictionary:
 				"ocean_color": Color(0.04, 0.06, 0.16), "road_color": Color(0.22, 0.22, 0.24),
 				"haze_color": Color(0.8, 0.45, 0.55),
 			}
-		_: # "coastal" — the hero sunset. Pink-purple SKY, but the world
-			# itself stays dark and cool: dark asphalt, blue ocean,
-			# mauve-grey fog — the pink must not drown the scene.
+		_: # "coastal" — the hero sunset. Cinematic rebuild (GATE R9):
+			# purple-top -> magenta -> peach horizon sky, warm peach
+			# fog so the far skyline melts into the sunset (the
+			# v2.1.0 cool/thin fog is superseded for coastal).
 			return {
-				"sky_top": Color(0.13, 0.05, 0.32), "sky_horizon": Color(0.98, 0.40, 0.52),
-				"ground_bottom": Color(0.08, 0.06, 0.14), "ground_horizon": Color(0.22, 0.12, 0.24),
+				"sky_top": Color(0.12, 0.02, 0.20), "sky_horizon": Color(1.00, 0.55, 0.45),
+				"ground_bottom": Color(0.08, 0.06, 0.14), "ground_horizon": Color(0.55, 0.32, 0.30), # Lead amendment A1 (2026-11-12): 0.35,0.20,0.22 left a black horizon wedge; this value warmed it. A1b (0.70,0.42,0.38) tried + REVERTED: no further effect on the residual thin line, proving it is geometry (plane far edge), not sky. Coastal only.
 				"sun_color": Color(1.0, 0.62, 0.38), "sun_energy": 1.7,
 				# Lane B glow-OFF compensation: fill 0.38 -> 0.50,
 				# palette dict only — _apply_palette overwrites
 				# build-time fill values on every biome change.
 				"fill_color": Color(1.0, 0.55, 0.42), "fill_energy": 0.50,
-				# Round 6 — fog cooled (R now below G: 0.33,0.35,0.43,
-				# was 0.38,0.36,0.43) and thinned (0.0022 -> 0.0018):
-				# the mid-road mauve (R-G ~40) is fog + grazing sky
-				# reflection, and fog is the part we can cool directly.
-				"fog_color": Color(0.33, 0.35, 0.43), "fog_density": 0.0018,
+				# Cinematic rebuild (GATE R9, inv1 §4.2): warm peach fog
+				# (0.90,0.60,0.55 — the PROBED colour) + density
+				# 0.0018 -> 0.0022. The v2.1.0 Round 6 cool/thin fog
+				# is superseded: the reel's horizon haze IS warm.
+				"fog_color": Color(0.90, 0.60, 0.55), "fog_density": 0.0022,
 				"ambient_color": Color(0.44, 0.44, 0.48),
 				"ocean_color": Color(0.04, 0.16, 0.42), "road_color": Color(0.30, 0.29, 0.32),
-				"haze_color": Color(0.95, 0.50, 0.42),
+				# Cinematic rebuild (GATE R4): haze 0.95,0.50,0.42 -> 1.00,0.62,0.50 (feeds the ocean sunset_color + road sun_tint + heat haze via _apply_palette).
+				"haze_color": Color(1.00, 0.62, 0.50),
 			}
 
 # ---------------------------------------------------------------- build
@@ -274,7 +294,7 @@ func _build_environment() -> void:
 	_sky_mat = ProceduralSkyMaterial.new()
 	_sky_mat.sky_top_color = _palette["sky_top"]
 	_sky_mat.sky_horizon_color = _palette["sky_horizon"]
-	_sky_mat.sky_curve = 0.12
+	_sky_mat.sky_curve = 0.18 # Cinematic rebuild (GATE R9): 0.12 -> 0.18 widens the pale horizon band. GLOBAL (all biomes). Falsifier: zenith pinks -> back to 0.14-0.15, widen via the ribbon instead.
 	_sky_mat.sky_energy_multiplier = 1.0
 	_sky_mat.ground_bottom_color = _palette["ground_bottom"]
 	_sky_mat.ground_horizon_color = _palette["ground_horizon"]
@@ -311,7 +331,7 @@ func _build_environment() -> void:
 	# Lane B: glow OFF — the fullscreen blur passes are the most
 	# expensive effect on tile-based Mali GPUs. Brightness is
 	# compensated per-biome in _apply_palette (window emission,
-	# sun-disc energy, SunGlow alpha) plus the coastal fill lift in
+	# sun-disc energy, sun-halo alpha) plus the coastal fill lift in
 	# get_biome_palette. The intensity/strength/bloom values below
 	# are kept so the recorded fallback (glow for neon only) can be
 	# re-enabled from _apply_palette without re-tuning.
@@ -323,14 +343,17 @@ func _build_environment() -> void:
 	_environment.fog_enabled = true
 	_environment.fog_light_color = _palette["fog_color"]
 	_environment.fog_light_energy = 0.4
-	# Round 6 — sun scatter 0.3 -> 0.15: scatter warms the fog
-	# exactly in the sun direction, i.e. straight down the road
-	# ahead, which is where the mauve lives. The sky keeps its
-	# pink; only the fog over the road cools.
-	_environment.fog_sun_scatter = 0.15
+	# Cinematic rebuild (GATE R9, inv1 §4.2): sun scatter 0.15 -> 0.35
+	# (warms fog toward the sun, i.e. down the road ahead) and height
+	# density 0.01 -> 0.003 (height fog was ~half the near-road fog
+	# lift). Both GLOBAL (all biomes) — all-6-biome renders required.
+	# Falsifier order if the near road/hero wash pink: scatter ->
+	# height_density -> density. fog_mode is NEVER set (depth fog is
+	# a measured no-op); aerial perspective left untouched (dead).
+	_environment.fog_sun_scatter = 0.35
 	_environment.fog_density = float(_palette["fog_density"])
 	_environment.fog_height = 8.0
-	_environment.fog_height_density = 0.01
+	_environment.fog_height_density = 0.003
 	_environment.fog_aerial_perspective = 0.12
 	_env = WorldEnvironment.new()
 	_env.environment = _environment
@@ -383,18 +406,22 @@ func _build_sun() -> void:
 	add_child(_fill)
 
 	# Visible sun disc: fog-disabled shader sphere sitting on the
-	# horizon over the ocean, plus a soft radial glow sprite around it.
+	# horizon over the ocean, plus soft radial halo quads around it
+	# (GATE R3 — the old SunGlow Sprite3D never read in renders).
 	# Disc at x=-54 keeps it ~13 deg left of centre in the portrait
 	# chase frame (horizontal FOV is only ~37 deg — the old x=-95 disc
 	# at 22 deg off-axis fell outside the frame entirely).
 	var disc_shader := load("res://shaders/sun_disc.gdshader") as Shader
 	var disc_mat := ShaderMaterial.new()
 	disc_mat.shader = disc_shader
-	disc_mat.set_shader_parameter("disc_color", Color(1.0, 0.38, 0.08))
-	# Lane B glow-OFF compensation: build-time disc default energy
-	# 0.8 -> 2.5 (the per-biome value is set in _apply_palette) and
-	# radius 7 -> 10 m (height follows: a sphere needs 2x radius).
-	disc_mat.set_shader_parameter("energy", 2.5)
+	# Cinematic rebuild (GATE R9 §4.3): near-white disc colour BEFORE
+	# energy — on this LDR renderer energy alone cannot un-yellow an
+	# orange base (the old (1,0.38,0.08) clipped R first -> yellow).
+	# Build-time defaults are the COASTAL values; _apply_palette
+	# overwrites them per biome on every biome change (both sites
+	# must agree). Position/radius UNCHANGED.
+	disc_mat.set_shader_parameter("disc_color", Color(1.0, 0.85, 0.70))
+	disc_mat.set_shader_parameter("energy", 3.0)
 	_sun_disc_mat = disc_mat
 	_sun_disc = MeshInstance3D.new()
 	_sun_disc.name = "SunDisc"
@@ -408,14 +435,31 @@ func _build_sun() -> void:
 	_sun_disc.position = Vector3(-54, 33, -233)
 	add_child(_sun_disc)
 
-	_sun_glow = Sprite3D.new()
-	_sun_glow.name = "SunGlow"
-	_sun_glow.texture = _make_radial_texture(256, Color(1.0, 0.45, 0.25), Color(1.0, 0.35, 0.55))
-	_sun_glow.modulate = Color(1.0, 0.7, 0.55, 0.6) # Lane B: alpha 0.45 -> 0.6 (glow-OFF compensation).
-	_sun_glow.pixel_size = 0.14
-	_sun_glow.position = Vector3(-54, 33, -232)
-	_sun_glow.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-	add_child(_sun_glow)
+	# Cinematic rebuild (GATE R3): the SunGlow Sprite3D is REMOVED
+	# (it never read in renders — fogged + low contrast) and replaced
+	# by billboarded halo quads using the proven in-repo pattern
+	# (StandardMaterial3D + shared radial texture, as in
+	# particles.gd): UNSHADED, TRANSPARENCY_ALPHA, BLEND_MODE_ADD,
+	# BILLBOARD_ENABLED, fog disabled, depth-draw DISABLED (still
+	# depth-TESTED, so skyline/palms occlude; never depth-WRITES),
+	# cast_shadow OFF (a transparent quad must not cast a square
+	# shadow or add shadow-pass draws). NO custom halo shader.
+	# Inner halo ~44 m at the disc +0.5 m toward the camera, peak
+	# alpha ~0.75; outer halo ~80 m, peak alpha ~0.28 (lead
+	# iteration 1: 0.55/0.18 read too weak — hard disc edge).
+	# Additive blending is order-independent, so the shared
+	# position is safe.
+	_halo_tex = _make_radial_texture(256, Color(1.0, 0.9, 0.8), Color(1.0, 0.55, 0.40))
+	_sun_halo_mat = _halo_material(Color(1.0, 1.0, 1.0, 0.75))
+	_sun_halo = _halo_quad(44.0, _sun_halo_mat)
+	_sun_halo.name = "SunHalo"
+	_sun_halo.position = Vector3(-54, 33, -232.5)
+	add_child(_sun_halo)
+	_sun_halo2_mat = _halo_material(Color(1.0, 1.0, 1.0, 0.28))
+	_sun_halo2 = _halo_quad(80.0, _sun_halo2_mat)
+	_sun_halo2.name = "SunHalo2"
+	_sun_halo2.position = Vector3(-54, 33, -232.5)
+	add_child(_sun_halo2)
 
 func _make_radial_texture(size: int, inner: Color, outer: Color) -> ImageTexture:
 	var img := Image.create(size, size, false, Image.FORMAT_RGBA8)
@@ -425,12 +469,45 @@ func _make_radial_texture(size: int, inner: Color, outer: Color) -> ImageTexture
 			var dx := (float(x) - half) / half
 			var dy := (float(y) - half) / half
 			var d: float = clamp(sqrt(dx * dx + dy * dy), 0.0, 1.0)
-			# Hot core, long soft falloff.
-			var t := pow(1.0 - d, 1.6)
+			# Hot core, long soft falloff. Lead iteration 1
+			# (2026-11-12): exponent 1.6 -> 1.2 and alpha t*t
+			# -> t — the steeper falloff left the sun disc
+			# hard-edged in the final renders (visible glow
+			# only ~1.5 disc radii). Wider/softer for sun
+			# AND lamp halos (shared texture).
+			var t := pow(1.0 - d, 1.2)
 			var c := outer.lerp(inner, t)
-			c.a = t * t
+			c.a = t
 			img.set_pixel(x, y, c)
 	return ImageTexture.create_from_image(img)
+
+# Halo pattern (GATE R3, shared by the sun halos in _build_sun and the
+# lamp halos in _build_poles): one radial texture, one material per
+# tint, one quad per halo. The texture carries the warm inner->outer
+# falloff; the material albedo_color carries the per-use tint + peak
+# alpha (texture alpha x material alpha).
+func _halo_material(tint: Color) -> StandardMaterial3D:
+	if _halo_tex == null:
+		_halo_tex = _make_radial_texture(256, Color(1.0, 0.9, 0.8), Color(1.0, 0.55, 0.40))
+	var m := StandardMaterial3D.new()
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	m.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	m.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
+	m.disable_fog = true
+	m.depth_draw_mode = BaseMaterial3D.DEPTH_DRAW_DISABLED
+	m.albedo_texture = _halo_tex
+	m.albedo_color = tint
+	return m
+
+func _halo_quad(size_m: float, mat: Material) -> MeshInstance3D:
+	var mi := MeshInstance3D.new()
+	var q := QuadMesh.new()
+	q.size = Vector2(size_m, size_m)
+	q.material = mat
+	mi.mesh = q
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	return mi
 
 func _build_ground() -> void:
 	# Far ground plane under everything (right side / scrub land).
@@ -498,7 +575,7 @@ func _build_ocean() -> void:
 	_ocean_mat.set_shader_parameter("sun_direction", Vector3(-0.23, 0.14, -0.96))
 	_ocean_mat.set_shader_parameter("wave_height", 0.35)
 	_ocean_mat.set_shader_parameter("wave_speed", 1.1)
-	_ocean_mat.set_shader_parameter("glitter_strength", 0.8) # R8: 1.0 -> 0.8 (hero glitter corridor still broad/bright)
+	_ocean_mat.set_shader_parameter("glitter_strength", 1.6) # Cinematic rebuild (GATE R4): 0.8 -> 1.6 CODE-side — the shader default (2.4) is overwritten, editing it does nothing.
 	_ocean = MeshInstance3D.new()
 	_ocean.name = "Ocean"
 	var ocean_mesh := PlaneMesh.new()
@@ -531,6 +608,12 @@ func _build_road() -> void:
 	_road_mat.set_shader_parameter("wear_color", Color(0.15, 0.15, 0.17))
 	_road_mat.set_shader_parameter("sun_tint", Color(1.0, 0.45, 0.55))
 	_road_mat.set_shader_parameter("wetness", 0.35)
+	# Cinematic rebuild (GATE R5 Step 2): Asphalt031 maps. Set once here
+	# at build; _apply_palette overwrites only asphalt_color/sun_tint/
+	# streak/wetness/reflection, so the texture params survive biome
+	# changes. (Load probe verified both paths, lane-b/load_probe.gd.)
+	_road_mat.set_shader_parameter("asphalt_tex", load("res://assets/asphalt031_color_1024.jpg") as Texture2D)
+	_road_mat.set_shader_parameter("asphalt_rough_tex", load("res://assets/asphalt031_rough_512.jpg") as Texture2D)
 	# Shoulders: pale concrete strips flanking the asphalt.
 	var shoulder_mat := _std(Color(0.32, 0.3, 0.3), 0.0, 0.9)
 	for i in range(SEGMENT_COUNT):
@@ -591,6 +674,9 @@ func _build_poles() -> void:
 	_pole_lamp_mat.emission_enabled = true
 	_pole_lamp_mat.emission = Color(1.0, 0.8, 0.5)
 	_pole_lamp_mat.emission_energy_multiplier = 2.5
+	# Cinematic rebuild (GATE R3): one shared halo material for the
+	# lamp halos below (retinted per biome in _apply_palette).
+	_lamp_halo_mat = _halo_material(Color(1.0, 0.95, 0.85, 0.5))
 	var pole_count := int(WORLD_SPAN / POLE_SPACING)
 	# Lane B merge: one MeshInstance (2 surfaces: pole + lamp) per
 	# pole instead of 3 boxes — 6 instances / 12 surfaces instead
@@ -620,6 +706,14 @@ func _build_poles() -> void:
 		merged.name = "PoleMesh%d" % i
 		merged.mesh = _merge_parts(parts, [pole_mat, _pole_lamp_mat])
 		group.add_child(merged)
+		# Cinematic rebuild (GATE R3): ONE halo quad (~1.6 m) per pole
+		# GROUP, parented to the scrolling Pole%d group at the
+		# lamp-head local position — +6 draws. A halo parented to
+		# static world (not scrolling) would be a bug.
+		var halo := _halo_quad(1.6, _lamp_halo_mat)
+		halo.name = "LampHalo%d" % i
+		halo.position = Vector3(side * 4.8, 7.3, 0)
+		group.add_child(halo)
 		_scroll_root.add_child(group)
 		_pole_segments.append(group)
 
@@ -632,7 +726,13 @@ func _build_palms() -> void:
 		# Initial placement ONLY — scroll()/recycling is untouched.
 		# Palm 0 is forced to the sand strip (always in frame),
 		# palm 1 to the land side, palm 2 takes a random side.
-		var z := FAR_Z + _rng.randf() * WORLD_SPAN
+		# Cinematic rebuild (follow-up): initial z capped at
+		# PALM_RECYCLE_Z so no palm EVER starts closer than 30 m
+		# ahead of the z=20 camera (the boot/countdown frame is
+		# static — a palm starting at z=+14 would loom for the
+		# whole countdown). Forced near-field palms below are
+		# already inside the window.
+		var z := _rng.randf_range(FAR_Z, PALM_RECYCLE_Z)
 		var side := -1
 		if i == 0:
 			z = _rng.randf_range(-30.0, -20.0)
@@ -1049,11 +1149,16 @@ func _build_haze() -> void:
 	_haze_plane.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_haze_plane)
 	# Distant haze band: a wide translucent ribbon hugging the horizon
-	# so the skyline melts into the sunset instead of ending in a hard cut.
+	# so the skyline melts into the sunset instead of ending in a hard
+	# cut. Cinematic rebuild (GATE R9): z -248 -> -226 (clears the
+	# skyline front faces at ~-228), alpha 0.18 -> 0.25, peach
+	# (1.0,0.62,0.52) albedo + emission. Coverage caveat: the ribbon
+	# spans y -1..11 m while landmark towers reach 34-42 m — upper
+	# towers rely on fog alone; "all towers melt" is NOT promised.
 	var band_mat := StandardMaterial3D.new()
-	band_mat.albedo_color = Color(0.75, 0.45, 0.55, 0.18)
+	band_mat.albedo_color = Color(1.0, 0.62, 0.52, 0.25)
 	band_mat.emission_enabled = true
-	band_mat.emission = Color(1.0, 0.45, 0.5)
+	band_mat.emission = Color(1.0, 0.62, 0.52)
 	band_mat.emission_energy_multiplier = 0.3
 	band_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	band_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
@@ -1064,7 +1169,15 @@ func _build_haze() -> void:
 	band_mesh.size = Vector2(340, 12)
 	band_mesh.material = band_mat
 	band.mesh = band_mesh
-	band.position = Vector3(0, 5, -248)
+	# PlaneMesh is HORIZONTAL (XZ, +Y normal): unrotated, this "ribbon"
+	# was a foreshortened 1-2 px sliver at y=5, not the vertical haze
+	# band the GATE/spec assumes (y -1..11 m) — proven by the
+	# pixel-identical horizon band before/after the z move. Rotate
+	# +90 deg about X so the 12 m dimension stands vertical (normal
+	# +Z, facing the camera) and the band spans y -1..11 m at z=-226,
+	# in front of the skyline front faces (~-228). Render-gated.
+	band.position = Vector3(0, 5, -226)
+	band.rotation_degrees = Vector3(90, 0, 0)
 	band.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(band)
 
@@ -1084,11 +1197,11 @@ func scroll(delta: float, speed_mps: float) -> void:
 			guard.position.z -= WORLD_SPAN
 	for pole in _pole_segments:
 		pole.position.z += dz
-		if pole.position.z > RECYCLE_Z + POLE_SPACING * 0.5:
+		if pole.position.z > POLE_RECYCLE_Z:
 			pole.position.z -= WORLD_SPAN
 	for palm in _palm_nodes:
 		palm.position.z += dz
-		if palm.position.z > RECYCLE_Z:
+		if palm.position.z > PALM_RECYCLE_Z:
 			_place_palm(palm, palm.position.z - WORLD_SPAN)
 	for verge in _verge_nodes:
 		verge.position.z += dz
@@ -1129,14 +1242,14 @@ func _apply_palette() -> void:
 	_sun.light_energy = float(p["sun_energy"])
 	_fill.light_color = p["fill_color"]
 	_fill.light_energy = float(p["fill_energy"])
-	# The sun disc follows the biome's sun: orange on the coast,
+	# The sun disc follows the biome's sun: near-white on the coast,
 	# pink in neon, pale in the desert, white in the snow.
-	_sun_disc_mat.set_shader_parameter("disc_color", p["sun_color"] if _biome != "coastal" else Color(1.0, 0.38, 0.08))
+	_sun_disc_mat.set_shader_parameter("disc_color", p["sun_color"] if _biome != "coastal" else Color(1.0, 0.85, 0.70))
 	# Lane B glow-OFF compensation: disc energy is per-biome HERE
 	# (this runs on every biome change and overwrites the
-	# build-time default): coastal 2.5, neon 1.2, desert/canyon
-	# 2.0, snow 1.5, rain 1.0.
-	var disc_energy := 2.5
+	# build-time default): coastal 3.0 (cinematic rebuild, was 2.5),
+	# neon 1.2, desert/canyon 2.0, snow 1.5, rain 1.0.
+	var disc_energy := 3.0
 	match _biome:
 		"neon":
 			disc_energy = 1.2
@@ -1147,6 +1260,36 @@ func _apply_palette() -> void:
 		"rain":
 			disc_energy = 1.0
 	_sun_disc_mat.set_shader_parameter("energy", disc_energy)
+	# Halo tints per biome (GATE R3/R9 — Lane B decision, recorded):
+	# the radial texture is warm, so tints multiply toward each
+	# biome's sun. Coastal warm peach (texture as-is); neon pink
+	# (matches the pink disc) + cool lamp halos; snow muted white;
+	# rain muted + dimmer; canyon/desert warm. The ribbon keeps its
+	# peach in all biomes this pass (decision: no palette keys may
+	# change; all-6 renders are the check — see REPORT.md).
+	var sun_tint := Color(1.0, 1.0, 1.0)
+	var sun_alpha := 0.75
+	var sun2_alpha := 0.28
+	var lamp_tint := Color(1.0, 0.95, 0.85, 0.5)
+	match _biome:
+		"neon":
+			sun_tint = Color(1.0, 0.75, 0.95)
+			lamp_tint = Color(0.75, 0.85, 1.0, 0.5)
+		"snow":
+			sun_tint = Color(0.9, 0.92, 1.0)
+			lamp_tint = Color(0.9, 0.92, 1.0, 0.4)
+		"rain":
+			sun_tint = Color(1.0, 0.85, 0.8)
+			sun_alpha = 0.45
+			sun2_alpha = 0.16
+			lamp_tint = Color(1.0, 0.9, 0.85, 0.35)
+		"canyon":
+			sun_tint = Color(1.0, 0.9, 0.75)
+		"desert":
+			sun_tint = Color(1.0, 0.95, 0.85)
+	_sun_halo_mat.albedo_color = Color(sun_tint.r, sun_tint.g, sun_tint.b, sun_alpha)
+	_sun_halo2_mat.albedo_color = Color(sun_tint.r, sun_tint.g, sun_tint.b, sun2_alpha)
+	_lamp_halo_mat.albedo_color = lamp_tint
 	_environment.ambient_light_color = p["ambient_color"]
 	_environment.fog_light_color = p["fog_color"]
 	_environment.fog_density = float(p["fog_density"])

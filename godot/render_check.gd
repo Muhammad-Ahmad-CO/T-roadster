@@ -7,7 +7,9 @@ extends Node3D
 ##       saved as render_check_<biome>.png (regression check).
 ##   camalt=1  — alternate chase camera (higher, pitched further down) to
 ##       test whether it widens the ocean in frame; canonical camera is
-##       the game's (0, 3.2, 7.5) -> look at (0, 1, -12).
+##       the game's (0, 4.2, 20.0) -> look at (0, 1.2, -12), FOV 64
+##       (Lane C R8 values, mirrored 2026-11-12; camalt branch kept
+##       byte-identical to its v2.1.0 numbers and is NOT run this pass).
 
 var _shot := 0
 var _biome := "coastal"
@@ -25,19 +27,20 @@ func _ready() -> void:
 		elif arg == "camalt=1":
 			_camalt = true
 
-	# --- Camera: reel chase framing ---
+	# --- Camera: reel chase framing (R8 mirror of main.gd Lane C values) ---
 	var cam := Camera3D.new()
 	if _camalt:
 		cam.position = Vector3(0.0, 4.2, 7.5)
+		cam.fov = 62.0
 	else:
-		cam.position = Vector3(0.0, 3.2, 7.5)
-	cam.fov = 62.0
+		cam.position = Vector3(0.0, 4.2, 20.0)
+		cam.fov = 64.0
 	cam.current = true
 	add_child(cam)
 	if _camalt:
 		cam.look_at(Vector3(0.0, 0.2, -14.0), Vector3.UP)
 	else:
-		cam.look_at(Vector3(0.0, 1.0, -12.0), Vector3.UP)
+		cam.look_at(Vector3(0.0, 1.2, -12.0), Vector3.UP)
 
 	# --- World + hero + traffic ---
 	var world := WorldBuilder.new()

@@ -4,8 +4,12 @@ render_mode specular_disabled, cull_back, depth_draw_opaque;
 // Animated sunset ocean. Vertex waves + analytic normals, deep blue
 // water with a pink sun-glitter path toward the sun. Specular is
 // DISABLED on purpose: at grazing angles a mirror-bright water just
-// reflects the pink sky and stops being blue — the water must stay
-// blue and get its sunset only from the explicit glitter term.
+// reflects the pink sky. Cinematic rebuild (GATE R4): the v2.1.0
+// "water must stay blue" rule is SUPERSEDED for coastal — the reel
+// water is mauve-pink everywhere, so the fresnel sunset/sky mixes,
+// the glitter and the horizon term now push toward sunset_color and a
+// far haze ramp melts distant water into the haze. Other biomes keep
+// their palette ocean colours via _apply_palette (unchanged wiring).
 
 uniform vec4 deep_color : source_color = vec4(0.04, 0.16, 0.42, 1.0);
 uniform vec4 shallow_color : source_color = vec4(0.10, 0.34, 0.60, 1.0);
@@ -15,7 +19,7 @@ uniform vec3 sun_direction = vec3(0.05, 0.10, -0.99);
 uniform float wave_height = 0.35;
 uniform float wave_speed = 1.1;
 uniform float glitter_strength = 2.4;
-uniform float glitter_sharpness = 120.0;
+uniform float glitter_sharpness = 70.0; // Cinematic rebuild (GATE R4): 120 -> 70, broader glint corridor. NOTE: glitter_strength above is OVERWRITTEN by world_builder.gd:_build_ocean (1.6) — editing the default does nothing.
 
 varying vec3 v_local;
 varying float v_wave;
@@ -62,14 +66,23 @@ void fragment() {
 
 	// Base water: deep colour in troughs, lighter on crests.
 	vec3 water = mix(deep_color.rgb, shallow_color.rgb, clamp(v_wave * 0.5 + 0.5, 0.0, 1.0));
-	// A little sunset reflection at grazing angles, but the water
-	// must stay BLUE — the old 0.65 mix plus the mirror-bright
-	// specular turned the whole sea into pink stripes. Round 4 cuts
-	// the grazing sunset/sky mixes further (0.10 / 0.05) because in
-	// the low hero angle the sea was reading as a white-pink glitter
-	// path with blue only at the edges.
-	vec3 col = mix(water, sunset_color.rgb, fresnel * 0.10);
-	col = mix(col, sky_tint.rgb, fresnel * 0.05);
+	// Sunset reflection at grazing angles. Cinematic rebuild (GATE
+	// R4): the v2.1.0 caps (0.10 / 0.05, "stay blue") are superseded
+	// for coastal — 0.45 / 0.30, so the low-angle sea reads mauve-pink
+	// like the reel instead of staying blue.
+	vec3 col = mix(water, sunset_color.rgb, fresnel * 0.45);
+	col = mix(col, sky_tint.rgb, fresnel * 0.30);
+
+	// Far haze ramp (GATE R4): a SEPARATE smoothstep — 0 inside
+	// ~30 m, full haze past ~150 m. The wording "reuse near_fade
+	// inverted" is WRONG and FORBIDDEN: near_fade is already
+	// 0-near/1-far, so literal inversion would pink near water and
+	// leave far water blue. near_fade's range (20-120 m) is FROZEN.
+	// The ramp runs BEFORE the glitter so the glint path still adds
+	// brightening on top of the hazed far water. Falsifier: mid-water
+	// (40-80 m) white-pink sheet -> push the ramp to 60-180 m.
+	float far_haze = smoothstep(30.0, 150.0, distance(v_world, CAMERA_POSITION_WORLD));
+	col = mix(col, sunset_color.rgb, far_haze);
 
 	// Sun glitter: tight specular toward the sun + a shimmering path.
 	vec3 sun_dir = normalize(sun_direction);
@@ -123,9 +136,9 @@ void fragment() {
 	// Lane B: foam constant 0.55 -> 0.4 per the rebuild gate.
 	float foam = foam_band * pow(foam_pat, 3.0) * 0.4;
 	col = mix(col, vec3(0.9, 0.93, 0.95), foam);
-	// Distant horizon glow.
+	// Distant horizon glow. Cinematic rebuild (GATE R4): 0.10 -> 0.35.
 	float horizon = smoothstep(-120.0, -230.0, v_local.z);
-	col = mix(col, sunset_color.rgb * 0.85, horizon * 0.10);
+	col = mix(col, sunset_color.rgb * 0.85, horizon * 0.35);
 
 	ALBEDO = col;
 	// Round 8: 0.25 -> 0.20 — the glitter's emission bloom is part

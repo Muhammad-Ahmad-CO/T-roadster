@@ -28,6 +28,14 @@ const INTRO_RAMP_Z := -20.0
 const INTRO_SPAWN_HOLD_M := 150.0
 const INTRO_MISS_DISTANCE_M := 50.0
 const INTRO_AUTO_FLIP_DELAY := 0.15
+# Chase camera (Lane C, GATE R8): single source of truth for ALL camera
+# sites (_build_camera, start_run snap, _physics_process). Change values
+# HERE only — a site edited alone silently reverts or jumps framing.
+# Nitro preserves the +8 kick over the base FOV.
+const CAM_FOV_BASE := 64.0
+const CAM_FOV_NITRO := 72.0
+const CAM_LOOK_Y := 1.2
+const CAM_LOOK_Z := -12.0
 
 var state: int = State.MENU
 
@@ -51,7 +59,8 @@ var _biome: String = "coastal"
 var _distance: float = 0.0
 var _speed: float = 0.0
 var _trauma: float = 0.0
-var _cam_base_pos := Vector3(0, 3.2, 7.5)
+var _nitro_was_active: bool = false # Lane C smoke hook: nitro activation edge
+var _cam_base_pos := Vector3(0, 4.2, 20.0)
 var _cam_x: float = 0.0 # damped camera x-follow; snapped to the hero in start_run/_to_menu
 var _shake_time: float = 0.0
 var _countdown_start_msec: int = 0
@@ -145,8 +154,8 @@ func _build_fallback_environment() -> void:
 	_environment.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
 	_environment.ambient_light_energy = 0.7
 	_environment.fog_enabled = true
-	_environment.fog_light_color = Color(0.9, 0.55, 0.45)
-	_environment.fog_density = 0.008
+	_environment.fog_light_color = Color(0.90, 0.60, 0.55)
+	_environment.fog_density = 0.0022
 	_environment.fog_sky_affect = 0.5
 	_environment.glow_enabled = false
 	_environment.glow_intensity = 0.5
@@ -175,12 +184,12 @@ func _build_camera() -> void:
 	_camera = Camera3D.new()
 	_camera.name = "Camera3D"
 	_camera.position = _cam_base_pos
-	_camera.fov = 62.0
+	_camera.fov = CAM_FOV_BASE
 	_camera.near = 0.1
 	_camera.far = 600.0
 	_camera.current = true
 	add_child(_camera)
-	_camera.look_at(Vector3(0, 1, -12), Vector3.UP)
+	_camera.look_at(Vector3(0, CAM_LOOK_Y, CAM_LOOK_Z), Vector3.UP)
 	_particles_root = Node3D.new()
 	_particles_root.name = "Particles"
 	add_child(_particles_root)
@@ -323,7 +332,7 @@ func _apply_biome() -> void:
 			"sky_top": Color(0.16, 0.05, 0.35), "sky_horizon": Color(0.95, 0.45, 0.25),
 			"ground_bottom": Color(0.05, 0.02, 0.08), "ground_horizon": Color(0.55, 0.2, 0.35),
 			"sun_color": Color(1.0, 0.75, 0.5), "sun_energy": 1.25,
-			"fog_color": Color(0.9, 0.55, 0.45), "fog_density": 0.008,
+			"fog_color": Color(0.90, 0.60, 0.55), "fog_density": 0.0022,
 			"ambient_color": Color(0.9, 0.6, 0.55), "ocean_color": Color(0.1, 0.3, 0.55),
 			"road_color": Color(0.09, 0.09, 0.11), "haze_color": Color(0.95, 0.6, 0.4),
 		}
@@ -331,8 +340,8 @@ func _apply_biome() -> void:
 	_sky_material.sky_horizon_color = palette.get("sky_horizon", Color(0.95, 0.45, 0.25))
 	_sky_material.ground_bottom_color = palette.get("ground_bottom", Color(0.05, 0.02, 0.08))
 	_sky_material.ground_horizon_color = palette.get("ground_horizon", Color(0.55, 0.2, 0.35))
-	_environment.fog_light_color = palette.get("fog_color", Color(0.9, 0.55, 0.45))
-	_environment.fog_density = float(palette.get("fog_density", 0.008))
+	_environment.fog_light_color = palette.get("fog_color", Color(0.90, 0.60, 0.55))
+	_environment.fog_density = float(palette.get("fog_density", 0.0022))
 	_environment.ambient_light_color = palette.get("ambient_color", Color(0.9, 0.6, 0.55))
 	_sun.light_color = palette.get("sun_color", Color(1.0, 0.75, 0.5))
 	_sun.light_energy = float(palette.get("sun_energy", 1.25))
@@ -362,7 +371,7 @@ func start_run() -> void:
 	# would freeze at the previous run's camera x.
 	_cam_x = player.position.x
 	_camera.position = Vector3(_cam_x, _cam_base_pos.y + player.position.y * 0.3, _cam_base_pos.z)
-	_camera.look_at(Vector3(_cam_x, 1.0 + player.position.y * 0.3, -12.0), Vector3.UP)
+	_camera.look_at(Vector3(_cam_x, CAM_LOOK_Y + player.position.y * 0.3, CAM_LOOK_Z), Vector3.UP)
 	traffic.start_run()
 	if _intro_active:
 		# Same ramp construction as the in-run ramp, placed 20 m ahead
@@ -626,8 +635,12 @@ func _physics_process(delta: float) -> void:
 	audio.set_music_mood(player.nitro_active or _police_active)
 	# --- camera: chase framing, FOV kick on nitro, trauma shake, never roll ---
 	_shake_time += delta
-	var target_fov: float = 70.0 if player.nitro_active else 62.0
+	var target_fov: float = CAM_FOV_NITRO if player.nitro_active else CAM_FOV_BASE
 	_camera.fov = lerpf(_camera.fov, target_fov, 1.0 - exp(-6.0 * delta))
+	# Lane C smoke hook (visual only): one white burst on nitro activation.
+	if player.nitro_active and not _nitro_was_active:
+		Particles.boost_smoke_burst(_particles_root, player.position + Vector3(0, 0.35, 1.8))
+	_nitro_was_active = player.nitro_active
 	_trauma = maxf(0.0, _trauma - delta * 1.6)
 	var shake_scale: float = 0.25 if menus.reduce_shake else 1.0
 	var sh: float = _trauma * _trauma * 0.4 * shake_scale
@@ -639,7 +652,7 @@ func _physics_process(delta: float) -> void:
 	# hero never slides past the frame edge at lanes ±4.5.
 	_cam_x = lerpf(_cam_x, player.position.x, 1.0 - exp(-5.5 * delta))
 	_camera.position = Vector3(_cam_x, _cam_base_pos.y + player.position.y * 0.3, _cam_base_pos.z) + off
-	_camera.look_at(Vector3(_cam_x, 1.0 + player.position.y * 0.3, -12.0), Vector3.UP)
+	_camera.look_at(Vector3(_cam_x, CAM_LOOK_Y + player.position.y * 0.3, CAM_LOOK_Z), Vector3.UP)
 
 # ------------------------------------------------------------------- scoring events
 
@@ -658,6 +671,8 @@ func _on_stunt_completed(kind: String) -> void:
 			hud.show_callout("DOUBLE STUNT  +%d" % gained, Color(1.0, 0.55, 0.15))
 			audio.play_chime()
 	Particles.spark_burst(_particles_root, player.position + Vector3(0, 1.2, 0))
+	# Lane C smoke hook (visual only): white burst as the stunt completes.
+	Particles.stunt_smoke_burst(_particles_root, player.position + Vector3(0, 1.2, 0))
 
 func _on_landed(quality: String) -> void:
 	if state != State.PLAYING:

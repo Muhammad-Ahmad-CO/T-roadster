@@ -257,49 +257,394 @@ static func _wheel(radius: float, width: float, pos: Vector3) -> Node3D:
 	wheel.add_child(mi)
 	return wheel
 
+# --------------------------------------- smooth-loft + lathe helpers
+# Lane A cinematic rebuild (GATE R7): the hero body is a bevelled
+# ArrayMesh loft, NOT _bake_append primitives — that helper only bakes
+# primitive meshes and is useless for loft geometry. Surf dicts are
+# filled DIRECTLY here; only the dict shape + _merged_mesh are reused.
+# Every quad gets its own 4 vertices (duplicated at every ring), so
+# hard creases are NORMAL breaks only: analytic smooth normals
+# everywhere except deliberate crease stations, where the longitudinal
+# tangent is one-sided. UVs are dummy zeros (no normal maps / no
+# textures on the hero) — _merged_mesh requires a UV array per surface.
+
+static func _quad_append(surf: Dictionary, a: Vector3, b: Vector3, c: Vector3, d: Vector3, na: Vector3, nb: Vector3, nc: Vector3, nd: Vector3) -> void:
+	var v: PackedVector3Array = surf["v"]
+	var n: PackedVector3Array = surf["n"]
+	var uv: PackedVector2Array = surf["uv"]
+	var ii: PackedInt32Array = surf["i"]
+	var base: int = v.size()
+	v.append(a)
+	v.append(b)
+	v.append(c)
+	v.append(d)
+	n.append(na)
+	n.append(nb)
+	n.append(nc)
+	n.append(nd)
+	uv.append(Vector2.ZERO)
+	uv.append(Vector2.ZERO)
+	uv.append(Vector2.ZERO)
+	uv.append(Vector2.ZERO)
+	# Winding (a,b,c),(a,c,d): Godot front faces wind so the
+	# geometric normal (b-a)x(c-a) points INWARD (proven against
+	# BoxMesh/CylinderMesh ground truth in probe_wind.gd: 12/12 and
+	# 96/96 triangles have vertex normal == -(b-a)x(c-a)). The
+	# (a,c,b) order tried first was inside-out (culled from
+	# outside). Do not "fix" without re-running probe_wind.gd.
+	ii.append(base + 0)
+	ii.append(base + 1)
+	ii.append(base + 2)
+	ii.append(base + 0)
+	ii.append(base + 2)
+	ii.append(base + 3)
+	surf["v"] = v
+	surf["n"] = n
+	surf["uv"] = uv
+	surf["i"] = ii
+
+static func _rounded_ring(hw: float, yb: float, yt: float, r: float, seg: int) -> Array:
+	# Rounded-rectangle ring in the XY plane, CCW seen from +Z (rear
+	# view): up the right edge, left across the top, down the left
+	# edge, right across the bottom. 4*seg points. The corner radius
+	# is clamped so thin stations never invert.
+	var rr: float = minf(r, minf(hw * 0.9, (yt - yb) * 0.45))
+	var pts: Array = []
+	var corners: Array = [
+		[Vector2(hw - rr, yt - rr), 0.0],
+		[Vector2(-hw + rr, yt - rr), PI * 0.5],
+		[Vector2(-hw + rr, yb + rr), PI],
+		[Vector2(hw - rr, yb + rr), PI * 1.5],
+	]
+	for ci in range(4):
+		var corner: Array = corners[ci]
+		var cen: Vector2 = corner[0]
+		var a0: float = corner[1]
+		for k in range(seg):
+			var a: float = a0 + (PI * 0.5) * float(k) / float(seg)
+			pts.append(Vector2(cen.x + cos(a) * rr, cen.y + sin(a) * rr))
+	return pts
+
+static func _loft_normal(rings: Array, stations: Array, seg: int, row: int, j: int) -> Vector3:
+	# Analytic smooth normal: cross of the around-ring tangent and
+	# the along-length tangent. Central difference along Z, EXCEPT at
+	# crease boundaries (and the loft ends), where the tangent is
+	# one-sided — that is the hard crease, with no position gap.
+	var k: int = seg + row
+	var ring: Array = rings[k]
+	var npt: int = ring.size()
+	var jp: int = (j + 1) % npt
+	var jm: int = (j - 1 + npt) % npt
+	var p_next: Vector3 = ring[jp]
+	var p_prev: Vector3 = ring[jm]
+	var ts: Vector3 = p_next - p_prev
+	var nst: int = stations.size()
+	var tz: Vector3
+	var p_here: Vector3 = ring[j]
+	if row == 0 and (seg == 0 or bool((stations[seg - 1] as Dictionary)["crease"])):
+		var ring_next: Array = rings[k + 1]
+		var p_fwd: Vector3 = ring_next[j]
+		tz = p_fwd - p_here
+	elif row == 1 and (seg == nst - 2 or bool((stations[seg] as Dictionary)["crease"])):
+		var ring_prev: Array = rings[k - 1]
+		var p_back: Vector3 = ring_prev[j]
+		tz = p_here - p_back
+	else:
+		var ring_f: Array = rings[k + 1]
+		var ring_b: Array = rings[k - 1]
+		var p_f: Vector3 = ring_f[j]
+		var p_b: Vector3 = ring_b[j]
+		tz = p_f - p_b
+	var n: Vector3 = ts.cross(tz)
+	if n.length() < 0.00001:
+		return Vector3.UP
+	return n.normalized()
+
+static func _loft_append(surfs: Array, stations: Array, mode: int, idx_paint: int, idx_low: int, idx_dark: int, low_y: float, bed_z0: float, bed_z1: float) -> void:
+	# stations: Array of Dictionary {z, hw, yb, yt, r, crease}.
+	# mode 0 = body rules: bed-floor top faces -> idx_dark, faces
+	# below low_y -> idx_low (two-tone lower band + underside), the
+	# rest -> idx_paint. mode 1 = every face into surfs[0]
+	# (glasshouse loft / dark inner loft).
+	var nst: int = stations.size()
+	var rings: Array = []
+	for si in range(nst):
+		var st: Dictionary = stations[si]
+		var ring2: Array = _rounded_ring(float(st["hw"]), float(st["yb"]), float(st["yt"]), float(st["r"]), 4)
+		var ring3: Array = []
+		var z: float = float(st["z"])
+		for p2 in ring2:
+			var pp: Vector2 = p2
+			ring3.append(Vector3(pp.x, pp.y, z))
+		rings.append(ring3)
+	var first_ring: Array = rings[0]
+	var npt: int = first_ring.size()
+	for s in range(nst - 1):
+		var ring_a: Array = rings[s]
+		var ring_b: Array = rings[s + 1]
+		for j in range(npt):
+			var j2: int = (j + 1) % npt
+			var a: Vector3 = ring_a[j]
+			var b: Vector3 = ring_b[j]
+			var cc: Vector3 = ring_b[j2]
+			var d: Vector3 = ring_a[j2]
+			var na: Vector3 = _loft_normal(rings, stations, s, 0, j)
+			var nb: Vector3 = _loft_normal(rings, stations, s, 1, j)
+			var nc: Vector3 = _loft_normal(rings, stations, s, 1, j2)
+			var nd: Vector3 = _loft_normal(rings, stations, s, 0, j2)
+			var target: Dictionary = surfs[0]
+			if mode == 0:
+				var fc: Vector3 = (a + b + cc + d) * 0.25
+				var an: Vector3 = (na + nb + nc + nd).normalized()
+				if an.y > 0.5 and fc.z > bed_z0 and fc.z < bed_z1:
+					target = surfs[idx_dark]
+				elif fc.y < low_y:
+					target = surfs[idx_low]
+				else:
+					target = surfs[idx_paint]
+			_quad_append(target, a, b, cc, d, na, nb, nc, nd)
+
+static func _cap_append(surf: Dictionary, st: Dictionary, facing_rear: bool) -> void:
+	# Flat fan cap for a loft end station. Separate vertices with a
+	# flat +/-Z normal = hard break from the loft sides.
+	var ring2: Array = _rounded_ring(float(st["hw"]), float(st["yb"]), float(st["yt"]), float(st["r"]), 4)
+	var npt: int = ring2.size()
+	var cz: float = float(st["z"])
+	var cy: float = (float(st["yb"]) + float(st["yt"])) * 0.5
+	var center := Vector3(0.0, cy, cz)
+	var nrm := Vector3(0, 0, 1) if facing_rear else Vector3(0, 0, -1)
+	var v: PackedVector3Array = surf["v"]
+	var n: PackedVector3Array = surf["n"]
+	var uv: PackedVector2Array = surf["uv"]
+	var ii: PackedInt32Array = surf["i"]
+	var base: int = v.size()
+	v.append(center)
+	n.append(nrm)
+	uv.append(Vector2.ZERO)
+	for p2 in ring2:
+		var pp: Vector2 = p2
+		v.append(Vector3(pp.x, pp.y, cz))
+		n.append(nrm)
+		uv.append(Vector2.ZERO)
+	for j in range(npt):
+		var j2: int = (j + 1) % npt
+		if facing_rear:
+			ii.append(base + 0)
+			ii.append(base + 1 + j2)
+			ii.append(base + 1 + j)
+		else:
+			ii.append(base + 0)
+			ii.append(base + 1 + j)
+			ii.append(base + 1 + j2)
+	surf["v"] = v
+	surf["n"] = n
+	surf["uv"] = uv
+	surf["i"] = ii
+
+static func _bake_box(surf: Dictionary, size: Vector3, xform: Transform3D) -> void:
+	var m := BoxMesh.new()
+	m.size = size
+	_bake_append(surf, m, xform)
+
+static func _bake_cyl(surf: Dictionary, r_top: float, r_bot: float, height: float, segments: int, xform: Transform3D) -> void:
+	var m := CylinderMesh.new()
+	m.top_radius = r_top
+	m.bottom_radius = r_bot
+	m.height = height
+	m.radial_segments = segments
+	_bake_append(surf, m, xform)
+
+static func _xf(pos: Vector3, euler_deg: Vector3) -> Transform3D:
+	return Transform3D(Basis.from_euler(Vector3(deg_to_rad(euler_deg.x), deg_to_rad(euler_deg.y), deg_to_rad(euler_deg.z))), pos)
+
+static func _revolve_append(surf: Dictionary, profile: Array, segments: int, rot: Basis) -> void:
+	# Lathe: `profile` is Array[Vector2] (radius, axial), ordered
+	# inboard -> outboard, revolved about the Y axis and then rotated
+	# by `rot` into the X axle. Profile normals are per-point averages
+	# of adjacent segment normals in the (r, axial) plane, revolved
+	# and rotated — smooth shoulders, no facet banding.
+	var np: int = profile.size()
+	var seg_n: Array = []
+	for i in range(np - 1):
+		var p0: Vector2 = profile[i]
+		var p1: Vector2 = profile[i + 1]
+		var t: Vector2 = (p1 - p0).normalized()
+		seg_n.append(Vector2(t.y, -t.x))
+	var pt_n: Array = []
+	for i in range(np):
+		var acc := Vector2.ZERO
+		if i > 0:
+			var sn0: Vector2 = seg_n[i - 1]
+			acc += sn0
+		if i < np - 1:
+			var sn1: Vector2 = seg_n[i]
+			acc += sn1
+		pt_n.append(acc.normalized())
+	for i in range(np - 1):
+		for j in range(segments):
+			var j2: int = (j + 1) % segments
+			var th0: float = TAU * float(j) / float(segments)
+			var th1: float = TAU * float(j2) / float(segments)
+			var pa: Array = _rev_pt(profile, pt_n, i, th0, rot)
+			var pb: Array = _rev_pt(profile, pt_n, i + 1, th0, rot)
+			var pc: Array = _rev_pt(profile, pt_n, i + 1, th1, rot)
+			var pd: Array = _rev_pt(profile, pt_n, i, th1, rot)
+			_quad_append(surf, pa[0], pb[0], pc[0], pd[0], pa[1], pb[1], pc[1], pd[1])
+
+static func _rev_pt(profile: Array, pt_n: Array, i: int, th: float, rot: Basis) -> Array:
+	var p: Vector2 = profile[i]
+	var n2: Vector2 = pt_n[i]
+	var s: float = sin(th)
+	var co: float = cos(th)
+	var pos_y := Vector3(p.x * s, p.y, p.x * co)
+	var nrm_y := Vector3(n2.x * s, n2.y, n2.x * co)
+	return [rot * pos_y, (rot * nrm_y).normalized()]
+
+static func _fan_append(surf: Dictionary, center: Vector3, radius: float, axis: Vector3, segments: int) -> void:
+	# Flat disc fan facing along `axis` (unit X for wheel faces).
+	# Winding (center, j+1, j): the (u, w) basis makes
+	# (center, j, j+1) point (b-a)x(c-a) along +axis, and Godot
+	# front faces need that cross product pointing INWARD (see
+	# _quad_append / probe_wind.gd), so the order is reversed.
+	var up := Vector3.UP
+	if absf(axis.dot(up)) > 0.9:
+		up = Vector3.FORWARD
+	var u: Vector3 = axis.cross(up).normalized()
+	var w: Vector3 = axis.cross(u).normalized()
+	var v: PackedVector3Array = surf["v"]
+	var n: PackedVector3Array = surf["n"]
+	var uv: PackedVector2Array = surf["uv"]
+	var ii: PackedInt32Array = surf["i"]
+	var base: int = v.size()
+	v.append(center)
+	n.append(axis)
+	uv.append(Vector2.ZERO)
+	for j in range(segments):
+		var th: float = TAU * float(j) / float(segments)
+		v.append(center + (u * cos(th) + w * sin(th)) * radius)
+		n.append(axis)
+		uv.append(Vector2.ZERO)
+	for j in range(segments):
+		var j2: int = (j + 1) % segments
+		ii.append(base + 0)
+		ii.append(base + 1 + j2)
+		ii.append(base + 1 + j)
+	surf["v"] = v
+	surf["n"] = n
+	surf["uv"] = uv
+	surf["i"] = ii
+
+static func _make_hero_halo() -> MeshInstance3D:
+	# Hero taillight halo: ONE quad under Body, GATE R3
+	# StandardMaterial3D pattern duplicated locally (NO cross-file
+	# call): UNSHADED + TRANSPARENCY_ALPHA + BLEND_MODE_ADD +
+	# BILLBOARD_ENABLED + disable_fog + DEPTH_DRAW_DISABLED (still
+	# depth-TESTED, so the car occludes it from the front) + the
+	# local radial texture + cast_shadow OFF (no square shadows).
+	var mat := StandardMaterial3D.new()
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	mat.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
+	mat.disable_fog = true
+	mat.depth_draw_mode = BaseMaterial3D.DEPTH_DRAW_DISABLED
+	mat.albedo_texture = _make_glow_texture(128)
+	mat.albedo_color = Color(1.0, 0.25, 0.20, 0.5)
+	var quad := QuadMesh.new()
+	quad.size = Vector2(2.2, 2.2)
+	quad.material = mat
+	var mi := MeshInstance3D.new()
+	mi.mesh = quad
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	mi.position = Vector3(0.0, 0.86, 2.38)
+	mi.name = "HeroHalo"
+	return mi
+
 static func _hero_wheel(radius: float, width: float, pos: Vector3) -> Node3D:
-	# Hero-only wheel: tyre + torus rim + bright hub + 2 spokes.
-	# Returns an UNNAMED pivot (the caller names it WheelFL/FR/RL/RR);
-	# player.gd spins it via rotation.x, so ALL geometry lives on the
-	# X axis. TorusMesh defaults to the Y axis (thin axis Y, probed)
-	# — the rim is rotated Z 90 deg into the YZ wheel plane, or it
-	# renders as a horizontal donut. Rim + spokes sit on the OUTBOARD
-	# face (sign of pos.x): the tyre is a capped solid, so a centred
-	# rim would be hidden inside it.
+	# Hero-only lathe wheel: revolved tyre (rounded shoulders) +
+	# rim lip + face discs + hub + 5 outboard spokes. Returns an
+	# UNNAMED pivot (the caller names it WheelFL/FR/RL/RR);
+	# player.gd spins it via rotation.x, so ALL geometry lives on
+	# the X axis. The revolve is built about Y and ROTATED into the
+	# X axle (rotZ -90 deg maps +Y -> +X, so profile axial == final
+	# X) — the same trap the old TorusMesh comment recorded, made
+	# explicit. Outboard detail is MIRRORED by construction: two
+	# mesh variants keyed by outboard sign (spokes + rim lip on the
+	# outboard face only), NO negative-scale mirroring, so winding
+	# and culling are identical on both sides. Visual radius stays
+	# 0.42 vs WHEEL_RADIUS 0.35 (frozen mismatch, NOT fixed here).
 	var wheel := Node3D.new()
 	wheel.position = pos
-	var out := 1.0 if pos.x >= 0.0 else -1.0
-	var tyre_mat := _std(Color(0.05, 0.05, 0.06), 0.0, 0.9)
-	var rim_mat := _std(Color(0.62, 0.64, 0.68), 0.9, 0.3)
-	var hub_mat := _std(Color(0.82, 0.82, 0.85), 0.9, 0.2)
-	var spoke_mat := _std(Color(0.35, 0.36, 0.39), 0.8, 0.35)
-	var tyre := _cyl(radius, radius, width, Vector3.ZERO, tyre_mat, 20)
-	tyre.rotation_degrees = Vector3(0, 0, 90)
-	wheel.add_child(tyre)
-	var rim := MeshInstance3D.new()
-	var torus := TorusMesh.new()
-	torus.inner_radius = radius * 0.45
-	torus.outer_radius = radius * 0.69
-	torus.rings = 8
-	torus.ring_segments = 20
-	torus.material = rim_mat
-	rim.mesh = torus
-	rim.position = Vector3(out * (width * 0.5 - 0.02), 0, 0)
-	rim.rotation_degrees = Vector3(0, 0, 90)
-	wheel.add_child(rim)
-	var hub := _cyl(radius * 0.33, radius * 0.33, width + 0.06, Vector3.ZERO, hub_mat, 12)
-	hub.rotation_degrees = Vector3(0, 0, 90)
-	wheel.add_child(hub)
-	var spoke_len := radius * 1.28
-	for k in range(2):
-		var spoke := _box(Vector3(0.05, spoke_len, 0.12), Vector3(out * (width * 0.5 - 0.01), 0, 0), spoke_mat)
-		spoke.rotation_degrees = Vector3(90.0 * float(k), 0, 0)
-		wheel.add_child(spoke)
+	var out: float = 1.0 if pos.x >= 0.0 else -1.0
+	var key: Array = ["herowheel_lathe", radius, width, out]
+	var mesh: ArrayMesh = null
+	if _mesh_cache.has(key):
+		mesh = _mesh_cache[key] as ArrayMesh
+	else:
+		var rs: float = radius / 0.42
+		var ws: float = width / 0.34
+		var half: float = width * 0.5
+		var tyre_mat := _std(Color(0.05, 0.05, 0.06), 0.0, 0.9)
+		var metal_mat := _std(Color(0.62, 0.64, 0.68), 0.9, 0.3)
+		var surf_tyre := _surf_new()
+		var surf_metal := _surf_new()
+		var rot := Basis(Vector3(0, 0, 1), -PI * 0.5)
+		var tyre_profile: Array = [
+			Vector2(0.20 * rs, -half), Vector2(0.34 * rs, -half),
+			Vector2(0.395 * rs, -0.14 * ws), Vector2(0.42 * rs, -0.08 * ws),
+			Vector2(0.42 * rs, 0.08 * ws), Vector2(0.395 * rs, 0.14 * ws),
+			Vector2(0.34 * rs, half), Vector2(0.20 * rs, half),
+		]
+		_revolve_append(surf_tyre, tyre_profile, 20, rot)
+		# Rim lip: [axial distance from centre, radius], traversed
+		# inboard -> outboard in FINAL X for either side (reversed
+		# list for the left wheels) so profile normals stay outward.
+		var lip_d: Array = [
+			[0.10, 0.29], [0.145, 0.315], [0.17, 0.305], [0.17, 0.28],
+		]
+		var lip: Array = []
+		if out > 0.0:
+			for e in lip_d:
+				var ee: Array = e
+				lip.append(Vector2(float(ee[1]) * rs, float(ee[0]) * ws))
+		else:
+			for ei in range(lip_d.size() - 1, -1, -1):
+				var ee2: Array = lip_d[ei]
+				lip.append(Vector2(float(ee2[1]) * rs, -float(ee2[0]) * ws))
+		_revolve_append(surf_metal, lip, 20, rot)
+		_fan_append(surf_metal, Vector3(out * 0.155 * ws, 0, 0), 0.30 * rs, Vector3(out, 0, 0), 20)
+		_fan_append(surf_metal, Vector3(-out * 0.155 * ws, 0, 0), 0.30 * rs, Vector3(-out, 0, 0), 20)
+		_bake_cyl(surf_metal, 0.09 * rs, 0.09 * rs, width + 0.06, 12, Transform3D(Basis(Vector3(0, 0, 1), PI * 0.5), Vector3.ZERO))
+		var spoke_mesh := BoxMesh.new()
+		spoke_mesh.size = Vector3(0.05, 0.24 * rs, 0.10)
+		for k in range(5):
+			var ang: float = TAU * float(k) / 5.0
+			var xform := Transform3D(Basis(Vector3(1, 0, 0), ang), Vector3(out * 0.16 * ws, 0, 0)) * Transform3D(Basis(), Vector3(0, 0.185 * rs, 0))
+			_bake_append(surf_metal, spoke_mesh, xform)
+		mesh = _merged_mesh([surf_tyre, surf_metal], [tyre_mat, metal_mat])
+		_mesh_cache[key] = mesh
+	var mi := MeshInstance3D.new()
+	mi.mesh = mesh
+	wheel.add_child(mi)
 	return wheel
 
 # ------------------------------------------------------- hero pickup
 
+static func _st(z: float, hw: float, yb: float, yt: float, r: float, crease: bool = false) -> Dictionary:
+	return {"z": z, "hw": hw, "yb": yb, "yt": yt, "r": r, "crease": crease}
+
 static func build_hero_pickup(paint: Color) -> Node3D:
+	# Cinematic rebuild (GATE R7): smooth bevelled ArrayMesh loft
+	# behind the FROZEN signature. Root "HeroPickup" (-Z forward),
+	# "Body" child (all body visuals under it), "Wheels" sibling,
+	# pivots (±1.02, 0.42, ±1.45), rear face z=+2.32, roof ~1.49,
+	# per-invocation materials (NO global/static mesh cache — the
+	# merged mesh is rebuilt per call; _std cache is per-invocation
+	# only). HeadlightBar / TaillightBar stay SEPARATE MeshInstance3D
+	# nodes under Body; Underglow stays separate; HeroHalo is ONE
+	# quad under Body. NO BrakeL/BrakeR (FORBIDDEN this pass).
+	# Draws: BodyMesh 7 surfaces + 2 bars + underglow + halo +
+	# 4 wheels x 2 surfaces = 19 (cap 20, incl. underglow + halo).
 	_cache_begin()
 	var root := Node3D.new()
 	root.name = "HeroPickup"
@@ -311,11 +656,8 @@ static func build_hero_pickup(paint: Color) -> Node3D:
 	var paint_metallic := 0.6
 	var paint_rough := 0.25
 	# Round 5 — keep near-white paint WHITE under the pink sunset.
-	# The orange sun + mauve ambient + pink sky reflections (metallic
-	# 0.6 mirrors the pink sky) turned the white pickup pink-mauve
-	# (tailgate inset measured 190,129,137). Near-white paints get a
-	# cool blue-white albedo shift and lower metallic (less pink sky
-	# reflection); coloured garage skins are untouched.
+	# (Rule preserved exactly: cool blue-white shift + lower
+	# metallic for near-white paints; coloured skins untouched.)
 	if paint.r > 0.8 and paint.g > 0.8 and paint.b > 0.8:
 		paint_cool = Color(paint.r * 0.90, paint.g * 0.95, minf(paint.b * 1.04, 1.0))
 		paint_metallic = 0.35
@@ -325,174 +667,176 @@ static func build_hero_pickup(paint: Color) -> Node3D:
 	# metallic/roughness as the main paint.
 	var paint_low_mat := _std(Color(paint_cool.r * 0.85, paint_cool.g * 0.85, paint_cool.b * 0.85), paint_metallic, paint_rough)
 	var dark_mat := _std(Color(0.08, 0.08, 0.1), 0.2, 0.6)
-	# Lane A — glass no longer mirrors the pink sky: metallic 0.45 /
-	# roughness 0.22 / dark blue-grey albedo, so the glasshouse reads
-	# dark glass instead of a pale mirror.
+	# Glass no longer mirrors the pink sky: metallic 0.45 /
+	# roughness 0.22 / dark blue-grey albedo — dark glass.
 	var glass_mat := _std(Color(0.03, 0.05, 0.08), 0.45, 0.22)
-	var trim_mat := _std(Color(0.12, 0.12, 0.14), 0.4, 0.5)
-
-	# Two-tone hull: darker lower band (paint x0.85) with the main
-	# paint above it, so the lower body reads as a separate band.
-	body.add_child(_box(Vector3(2.0, 0.28, 4.6), Vector3(0, 0.44, 0), paint_low_mat))
-	body.add_child(_box(Vector3(1.94, 0.40, 4.6), Vector3(0, 0.70, 0), paint_mat))
-	# Angular nose wedge (prism slopes down toward the front, -Z).
-	var nose := _prism(Vector3(2.0, 0.5, 0.9), Vector3(0, 0.6, -2.35), paint_mat)
-	nose.rotation_degrees = Vector3(0, 180, 0)
-	body.add_child(nose)
-	# Hood: shallow sloped panel.
-	var hood := _box(Vector3(1.9, 0.1, 1.15), Vector3(0, 0.92, -1.55), paint_mat)
-	hood.rotation_degrees = Vector3(-4, 0, 0)
-	body.add_child(hood)
-	# Raked cab: narrower lower cab, two sloped glass prisms
-	# (windshield 25 deg, rear glass 27 deg), a narrower/shorter roof,
-	# side glass, and a dark inner block so no see-through gaps show
-	# between the glass prisms at glancing angles.
-	body.add_child(_box(Vector3(1.70, 0.30, 1.90), Vector3(0, 1.03, 0.55), paint_mat))
-	body.add_child(_box(Vector3(1.50, 0.24, 1.50), Vector3(0, 1.30, 0.50), dark_mat))
-	# PrismMesh's ridge runs along Z with the apex moving along X
-	# (probed: left_to_right 0 -> apex x=-half, 1 -> +half), so the
-	# glass wedges are rotated Y 90 deg: local X (slope run) becomes
-	# world Z. Windshield: tall edge at the rear (roof), sloping down
-	# to the hood. Rear glass: tall edge at the front, sloping down
-	# to the bed — the inset rear window, narrower than the cab.
-	body.add_child(_prism_slope(Vector3(0.55, 0.26, 1.62), Vector3(0, 1.31, -0.12), glass_mat, 0.0, 90.0))
-	body.add_child(_prism_slope(Vector3(0.50, 0.26, 1.62), Vector3(0, 1.31, 1.10), glass_mat, 1.0, 90.0))
-	# Side glass. (No A/C pillar boxes: an earlier iteration had
-	# them, and their white slabs covered the prisms' sloped side
-	# profiles and killed the rake read from the side. The prisms'
-	# triangles + the narrower roof carry the glasshouse shape.)
-	body.add_child(_box(Vector3(0.04, 0.26, 0.75), Vector3(-0.80, 1.31, 0.50), glass_mat))
-	body.add_child(_box(Vector3(0.04, 0.26, 0.75), Vector3(0.80, 1.31, 0.50), glass_mat))
-	# Roof panel: narrower and shorter than before.
-	body.add_child(_box(Vector3(1.50, 0.07, 0.85), Vector3(0, 1.455, 0.50), paint_mat))
-	# Open bed: darker floor + lower side walls (0.30 m) + tailgate.
-	body.add_child(_box(Vector3(1.9, 0.08, 1.35), Vector3(0, 0.92, 1.62), dark_mat))
-	body.add_child(_box(Vector3(0.08, 0.30, 1.35), Vector3(-0.94, 1.11, 1.62), paint_mat))
-	body.add_child(_box(Vector3(0.08, 0.30, 1.35), Vector3(0.94, 1.11, 1.62), paint_mat))
-	# Tailgate in THREE bands (>=0.12 m each): the old flat tailgate
-	# with micro-detail (0.015 m gaps, 0.025 m line) was below
-	# resolution at chase distance, so the gaps and the thin line are
-	# DELETED; the bands + one 0.06 m crease + two 0.04 m vertical
-	# creases carry the rear definition instead. The tailgate face
-	# stays at z=2.32 (same as before), so the exhaust anchor
-	# (0, 0.55, 2.3 in player space) keeps its old relationship to
-	# the rear face. All details stay proud of the face so nothing
-	# z-fights.
-	# Round 5 — the shaded tailgate panel is a rear face lit by the
-	# warm fill light plus the pink sky reflection, so a straight
-	# paint*0.78 still read pink-mauve (207,159,181). It gets a
-	# cooler tint (R pulled down hardest) and low metallic (less pink
-	# sky mirror) so the shaded tailgate panel reads cool white-grey,
-	# as a white panel in shadow should.
-	var paint_dark_mat := _std(Color(paint_cool.r * 0.68, paint_cool.g * 0.82, paint_cool.b * 0.85), 0.2, 0.35)
-	# Lead tuning 2026-11-12: the tailgate creases in near-black dark_mat
-	# read as a bold black cross at chase distance (coastal + neon
-	# renders). Mid-grey seam tone — visible definition, not a bar.
-	var crease_mat := _std(Color(0.42, 0.42, 0.46), 0.2, 0.5)
-	body.add_child(_box(Vector3(1.9, 0.14, 0.08), Vector3(0, 1.24, 2.28), paint_mat))
-	body.add_child(_box(Vector3(1.9, 0.14, 0.08), Vector3(0, 1.10, 2.28), paint_dark_mat))
-	body.add_child(_box(Vector3(1.9, 0.14, 0.08), Vector3(0, 0.96, 2.28), paint_mat))
-	body.add_child(_box(Vector3(1.92, 0.05, 0.10), Vector3(0, 1.285, 2.28), trim_mat))
-	body.add_child(_box(Vector3(1.70, 0.06, 0.015), Vector3(0, 1.10, 2.325), crease_mat))
-	body.add_child(_box(Vector3(0.04, 0.30, 0.015), Vector3(-0.55, 1.10, 2.325), crease_mat))
-	body.add_child(_box(Vector3(0.04, 0.30, 0.015), Vector3(0.55, 1.10, 2.325), crease_mat))
-	# Round 4 — rear definition kept: a number-plate recess + pale
-	# plate on the valance, a chrome exhaust tip bottom-right, a
-	# tread step on the bumper top, dark bed rail caps along both bed
-	# walls, and red wrap-around corner pods on the bed sides so the
-	# taillights turn the corner.
-	# Number plate: dark recess, then a pale plate inside it.
-	body.add_child(_box(Vector3(0.56, 0.17, 0.02), Vector3(0, 0.66, 2.325), dark_mat))
-	body.add_child(_box(Vector3(0.46, 0.11, 0.015), Vector3(0, 0.66, 2.34), _std(Color(0.85, 0.85, 0.80), 0.2, 0.5)))
-	# Exhaust tip: chrome cylinder poking out under the bumper right.
+	# Consolidated mid-grey trim: absorbs the old trim (0.12),
+	# rear-panel (0.38), bumper (0.32) and crease-grey (0.42)
+	# materials — one grey that reads with shape on sunless faces
+	# instead of a black hole (Round-6 direction). See REPORT.md.
+	var trim_mat := _std(Color(0.32, 0.32, 0.35), 0.3, 0.5)
+	var plate_mat := _std(Color(0.85, 0.85, 0.80), 0.2, 0.5)
 	var chrome_mat := _std(Color(0.7, 0.7, 0.72), 0.9, 0.25)
-	var exhaust := _cyl(0.06, 0.06, 0.14, Vector3(0.62, 0.34, 2.42), chrome_mat, 10)
-	exhaust.rotation_degrees = Vector3(90, 0, 0)
-	body.add_child(exhaust)
-	var exhaust_inner := _cyl(0.045, 0.045, 0.15, Vector3(0.62, 0.34, 2.42), dark_mat, 8)
-	exhaust_inner.rotation_degrees = Vector3(90, 0, 0)
-	body.add_child(exhaust_inner)
-	# Bumper tread step: a dark grip strip across the bumper top.
-	body.add_child(_box(Vector3(1.6, 0.03, 0.18), Vector3(0, 0.46, 2.34), dark_mat))
-	# Bed rail caps: dark caps on top of both bed side walls.
-	body.add_child(_box(Vector3(0.10, 0.04, 1.35), Vector3(-0.94, 1.28, 1.62), trim_mat))
-	body.add_child(_box(Vector3(0.10, 0.04, 1.35), Vector3(0.94, 1.28, 1.62), trim_mat))
-	# Wrap-around rear corner pods (red, emissive) on the bed sides.
-	# Round 6 — emission (1.0,0.02,0.02) @ 1.0 measured orange-red
-	# (255,60,36): the G comes from ACES desaturation of the bright
-	# red + the warm fill on the 0.35 albedo. Pure-red emission,
-	# darker albedo, slightly lower energy for a DEEP red.
-	var pod_mat := _std(Color(0.20, 0.0, 0.0), 0.0, 0.2, Color(1.0, 0.0, 0.0), 0.85)
-	body.add_child(_box(Vector3(0.03, 0.14, 0.30), Vector3(-0.99, 0.86, 2.05), pod_mat))
-	body.add_child(_box(Vector3(0.03, 0.14, 0.30), Vector3(0.99, 0.86, 2.05), pod_mat))
-	# Dark lower rear panel: two-tone rear (white tailgate above,
-	# dark valance below) so the back has shape at a glance. Uses its
-	# own lighter grey — the shared trim_mat rendered as a black hole
-	# on the sunless rear face.
-	# Round 6 — 0.28 -> 0.38: the valance still read as a near-black
-	# band under the hero; it must read as dark GREY with shape.
-	var rear_panel_mat := _std(Color(0.38, 0.38, 0.42), 0.3, 0.55)
-	body.add_child(_box(Vector3(1.9, 0.28, 0.02), Vector3(0, 0.62, 2.31), rear_panel_mat))
-	# Bed roll bar: crossbar BELOW the roofline (roof top 1.49), legs
-	# rising from the bed floor behind the cab.
-	body.add_child(_box(Vector3(1.7, 0.07, 0.07), Vector3(0, 1.41, 1.58), dark_mat))
-	body.add_child(_box(Vector3(0.07, 0.42, 0.07), Vector3(-0.8, 1.17, 1.58), dark_mat))
-	body.add_child(_box(Vector3(0.07, 0.42, 0.07), Vector3(0.8, 1.17, 1.58), dark_mat))
-	# Split side skirts (3 segments per side, gaps at the wheels) +
-	# front fender brows, rear haunches, dark wheel-well insets and
-	# one side character line per side. ALL under Body: they rotate
-	# with the body in stunts; only tyre/rim/spokes live under the
-	# wheel pivots.
-	for side in [-1, 1]:
-		var sx := float(side)
-		body.add_child(_box(Vector3(0.08, 0.18, 0.50), Vector3(sx * 1.0, 0.40, -2.20), trim_mat))
-		body.add_child(_box(Vector3(0.08, 0.18, 1.90), Vector3(sx * 1.0, 0.40, 0), trim_mat))
-		body.add_child(_box(Vector3(0.08, 0.18, 0.50), Vector3(sx * 1.0, 0.40, 2.20), trim_mat))
-		body.add_child(_box(Vector3(0.38, 0.09, 1.05), Vector3(sx * 1.03, 0.87, -1.45), paint_mat))
-		var haunch := _box(Vector3(0.30, 0.10, 0.95), Vector3(sx * 1.02, 0.88, 1.45), paint_mat)
-		haunch.rotation_degrees = Vector3(-12, 0, 0)
-		body.add_child(haunch)
-		# Wheel-well insets: shadow pockets SMALLER than the tyre, so
-		# the dark shows at the tyre's sides only — a full-size panel
-		# read as a black slab from the side.
-		body.add_child(_box(Vector3(0.05, 0.60, 0.90), Vector3(sx * 0.98, 0.44, -1.45), dark_mat))
-		body.add_child(_box(Vector3(0.05, 0.60, 0.90), Vector3(sx * 0.98, 0.44, 1.45), dark_mat))
-		var charline := _box(Vector3(0.03, 0.05, 3.20), Vector3(sx * 0.975, 0.74, -0.20), trim_mat)
-		charline.rotation_degrees = Vector3(-2, 0, 0)
-		body.add_child(charline)
-	# Front grille (dark, no logo) + bumpers.
-	body.add_child(_box(Vector3(1.7, 0.22, 0.08), Vector3(0, 0.62, -2.78), dark_mat))
-	body.add_child(_box(Vector3(2.02, 0.16, 0.22), Vector3(0, 0.38, -2.72), trim_mat))
-	# Round 6 — the REAR bumper was the near-black band under the
-	# hero (dark_mat 0.08 on a sunless rear face). It gets its own
-	# mid-grey material so the rear bottom reads as dark grey with
-	# shape, not a black hole; the front bumper keeps dark_mat.
-	var bumper_mat := _std(Color(0.32, 0.32, 0.35), 0.3, 0.5)
-	body.add_child(_box(Vector3(2.04, 0.18, 0.24), Vector3(0, 0.36, 2.34), bumper_mat))
-	# Side mirrors.
-	body.add_child(_box(Vector3(0.16, 0.12, 0.22), Vector3(-1.02, 1.18, -0.15), dark_mat))
-	body.add_child(_box(Vector3(0.16, 0.12, 0.22), Vector3(1.02, 1.18, -0.15), dark_mat))
+	# Deep-red tail emissive — Round-6 fix PRESERVED EXACTLY:
+	# albedo (0.20,0,0), pure-red emission @ 0.85. Do not "brighten".
+	var tail_mat := _std(Color(0.20, 0.0, 0.0), 0.0, 0.2, Color(1.0, 0.0, 0.0), 0.85)
+	# Front white emissive: bar + corner pods share one material
+	# (bar energy 4.0; pods were 3.0 — consolidated, see REPORT.md).
+	var front_mat := _std(Color(1, 1, 1), 0.0, 0.2, Color(1.0, 0.98, 0.9), 4.0)
 
-	# Full-width front light bar (emissive white) + rear red bar.
-	var front_light := _box(Vector3(1.86, 0.09, 0.06), Vector3(0, 0.82, -2.8), _std(Color(1, 1, 1), 0.0, 0.2, Color(1.0, 0.98, 0.9), 4.0))
+	var s_paint := _surf_new()
+	var s_low := _surf_new()
+	var s_glass := _surf_new()
+	var s_dark := _surf_new()
+	var s_trim := _surf_new()
+	var s_chrome := _surf_new()
+	var s_plate := _surf_new()
+
+	# --- Main body loft: 10 stations, nose -> tailgate. ---
+	# Top profile: nose 0.86 -> hood 0.95 -> cowl 1.00 -> cab
+	# beltline 1.16 -> bed floor 0.96 -> tailgate top 1.27. The bed
+	# is NOT a convex loft top: bed-region top faces go to the dark
+	# surface (bed floor) and separate walls/tailgate geometry below
+	# make the open bed. Creases after the cowl (hood edge) and the
+	# cab rear (bed-front edge) only; everything else flows smooth.
+	var stations: Array = [
+		_st(-2.80, 0.86, 0.34, 0.86, 0.10),
+		_st(-2.55, 0.97, 0.30, 0.88, 0.10),
+		_st(-2.20, 1.00, 0.30, 0.92, 0.09),
+		_st(-1.55, 1.00, 0.30, 0.95, 0.09),
+		_st(-0.55, 0.99, 0.30, 1.00, 0.09, true),
+		_st(-0.30, 0.93, 0.30, 1.16, 0.08),
+		_st(0.95, 0.93, 0.30, 1.16, 0.08, true),
+		_st(1.05, 0.98, 0.30, 0.96, 0.07),
+		_st(2.10, 0.98, 0.30, 0.96, 0.07),
+		_st(2.32, 0.96, 0.30, 1.27, 0.06),
+	]
+	_loft_append([s_paint, s_low, s_dark], stations, 0, 0, 1, 2, 0.55, 1.06, 2.08)
+	_cap_append(s_paint, stations[0], false)
+	_cap_append(s_paint, stations[9], true)
+
+	# --- Glasshouse: inset dark-glass loft + dark inner loft. ---
+	# The inner loft (same stations, shrunk) is the gap-hiding
+	# equivalent of the old dark inner block: no see-through gaps
+	# at glancing angles, and it can never poke through the raked
+	# windshield/rear glass the way a box would.
+	var glass_stations: Array = [
+		_st(-0.35, 0.80, 1.10, 1.16, 0.06),
+		_st(0.05, 0.79, 1.10, 1.44, 0.08),
+		_st(0.90, 0.77, 1.10, 1.44, 0.08),
+		_st(1.02, 0.74, 1.00, 1.14, 0.06),
+	]
+	_loft_append([s_glass], glass_stations, 1, 0, 0, 0, 0.0, 0.0, 0.0)
+	var inner_stations: Array = []
+	for gs in glass_stations:
+		var g: Dictionary = gs
+		inner_stations.append(_st(float(g["z"]), float(g["hw"]) * 0.92, float(g["yb"]) + 0.03, float(g["yt"]) - 0.03, float(g["r"]) * 0.9))
+	_loft_append([s_dark], inner_stations, 1, 0, 0, 0, 0.0, 0.0, 0.0)
+	_cap_append(s_dark, inner_stations[0], false)
+	_cap_append(s_dark, inner_stations[3], true)
+
+	var zero := Vector3.ZERO
+	# --- Paint details (baked boxes into the paint surface). ---
+	_bake_box(s_paint, Vector3(1.50, 0.07, 0.85), _xf(Vector3(0, 1.455, 0.48), zero))
+	# Open-bed walls (inset 0.01 from the loft side: no coplanar
+	# z-fight) + inner tailgate face.
+	_bake_box(s_paint, Vector3(0.08, 0.34, 1.30), _xf(Vector3(-0.93, 1.11, 1.66), zero))
+	_bake_box(s_paint, Vector3(0.08, 0.34, 1.30), _xf(Vector3(0.93, 1.11, 1.66), zero))
+	_bake_box(s_paint, Vector3(1.86, 0.32, 0.06), _xf(Vector3(0, 1.11, 2.24), zero))
+	# Fender brows + rear haunches over the wheels (slim: wide
+	# boxes read as rectangular tabs from above).
+	_bake_box(s_paint, Vector3(0.20, 0.09, 0.90), _xf(Vector3(-0.96, 0.88, -1.45), zero))
+	_bake_box(s_paint, Vector3(0.20, 0.09, 0.90), _xf(Vector3(0.96, 0.88, -1.45), zero))
+	_bake_box(s_paint, Vector3(0.20, 0.10, 0.85), _xf(Vector3(-0.96, 0.88, 1.45), Vector3(-12, 0, 0)))
+	_bake_box(s_paint, Vector3(0.20, 0.10, 0.85), _xf(Vector3(0.96, 0.88, 1.45), Vector3(-12, 0, 0)))
+	# Mirror caps (paint tops on the dark housings below).
+	_bake_box(s_paint, Vector3(0.16, 0.04, 0.22), _xf(Vector3(-1.00, 1.25, -0.15), zero))
+	_bake_box(s_paint, Vector3(0.16, 0.04, 0.22), _xf(Vector3(1.00, 1.25, -0.15), zero))
+
+	# --- Dark details. ---
+	# Grille (dark panel + chrome slats below read as the recess;
+	# a true recess needs a boolean the loft cannot do).
+	_bake_box(s_dark, Vector3(1.70, 0.22, 0.08), _xf(Vector3(0, 0.52, -2.79), zero))
+	# Wheel-well insets: shadow pockets smaller than the tyre, so
+	# the dark shows at the tyre's sides only.
+	for sx in [-1.0, 1.0]:
+		for sz in [-1.45, 1.45]:
+			_bake_box(s_dark, Vector3(0.05, 0.60, 0.90), _xf(Vector3(sx * 0.99, 0.44, sz), zero))
+	# Side mirrors: stalk + housing (housing tucked to x=1.00 so
+	# the cap does not read as floating from above).
+	for sx2 in [-1.0, 1.0]:
+		_bake_box(s_dark, Vector3(0.14, 0.04, 0.06), _xf(Vector3(sx2 * 0.92, 1.16, -0.15), zero))
+		_bake_box(s_dark, Vector3(0.16, 0.12, 0.22), _xf(Vector3(sx2 * 1.00, 1.18, -0.15), zero))
+	# Bed roll bar: crossbar BELOW the roofline (roof top 1.49).
+	_bake_box(s_dark, Vector3(1.70, 0.07, 0.07), _xf(Vector3(0, 1.41, 1.58), zero))
+	_bake_box(s_dark, Vector3(0.07, 0.42, 0.07), _xf(Vector3(-0.80, 1.17, 1.58), zero))
+	_bake_box(s_dark, Vector3(0.07, 0.42, 0.07), _xf(Vector3(0.80, 1.17, 1.58), zero))
+	# Bumper tread step + number-plate recess.
+	_bake_box(s_dark, Vector3(1.60, 0.03, 0.18), _xf(Vector3(0, 0.46, 2.34), zero))
+	_bake_box(s_dark, Vector3(0.56, 0.17, 0.02), _xf(Vector3(0, 0.66, 2.33), zero))
+	# Exhaust inner (dark bore inside the chrome tip below).
+	_bake_cyl(s_dark, 0.045, 0.045, 0.15, 8, _xf(Vector3(0.62, 0.34, 2.42), Vector3(90, 0, 0)))
+
+	# --- Trim details (mid-grey). ---
+	_bake_box(s_trim, Vector3(2.02, 0.16, 0.22), _xf(Vector3(0, 0.38, -2.72), zero))
+	_bake_box(s_trim, Vector3(2.04, 0.18, 0.24), _xf(Vector3(0, 0.36, 2.34), zero))
+	# Split side skirts (3 segments per side, gaps at the wheels).
+	for sx3 in [-1.0, 1.0]:
+		_bake_box(s_trim, Vector3(0.08, 0.18, 0.50), _xf(Vector3(sx3 * 1.0, 0.40, -2.20), zero))
+		_bake_box(s_trim, Vector3(0.08, 0.18, 1.90), _xf(Vector3(sx3 * 1.0, 0.40, 0), zero))
+		_bake_box(s_trim, Vector3(0.08, 0.18, 0.50), _xf(Vector3(sx3 * 1.0, 0.40, 2.20), zero))
+	# Bed rail caps.
+	_bake_box(s_trim, Vector3(0.12, 0.04, 1.30), _xf(Vector3(-0.93, 1.29, 1.66), zero))
+	_bake_box(s_trim, Vector3(0.12, 0.04, 1.30), _xf(Vector3(0.93, 1.29, 1.66), zero))
+	# Dark lower rear valance (proud 0.008 of the tail cap: no
+	# coplanar z-fight) + ONE horizontal tailgate seam. The two
+	# vertical creases are REMOVED (lead iteration 1, 2026-11-12):
+	# horizontal + verticals read as a bold "+" cross on the
+	# tailgate at chase distance — the v2.1.0 lesson, re-learned
+	# from the final renders. The single seam + loft cap carry
+	# the rear definition, matching the reel's clean tailgate.
+	_bake_box(s_trim, Vector3(1.90, 0.28, 0.02), _xf(Vector3(0, 0.62, 2.318), zero))
+	_bake_box(s_trim, Vector3(1.40, 0.05, 0.015), _xf(Vector3(0, 1.10, 2.33), zero))
+	# Side character lines (proud of the loft side so they read).
+	for sx4 in [-1.0, 1.0]:
+		_bake_box(s_trim, Vector3(0.04, 0.05, 3.10), _xf(Vector3(sx4 * 1.0, 0.76, -0.20), Vector3(-2, 0, 0)))
+
+	# --- Chrome details. ---
+	for gy in [0.46, 0.52, 0.58]:
+		_bake_box(s_chrome, Vector3(1.50, 0.02, 0.02), _xf(Vector3(0, gy, -2.835), zero))
+	_bake_cyl(s_chrome, 0.06, 0.06, 0.14, 10, _xf(Vector3(0.62, 0.34, 2.42), Vector3(90, 0, 0)))
+
+	# --- Number plate. ---
+	_bake_box(s_plate, Vector3(0.46, 0.11, 0.015), _xf(Vector3(0, 0.66, 2.345), zero))
+
+	var body_mesh := _merged_mesh([s_paint, s_low, s_glass, s_dark, s_trim, s_chrome, s_plate], [paint_mat, paint_low_mat, glass_mat, dark_mat, trim_mat, chrome_mat, plate_mat])
+	var body_mi := MeshInstance3D.new()
+	body_mi.mesh = body_mesh
+	body_mi.name = "BodyMesh"
+	body.add_child(body_mi)
+
+	# Full-width front light bar + corner pods, ONE merged mesh in
+	# ONE node (name preserved, 1 draw).
+	var s_front := _surf_new()
+	_bake_box(s_front, Vector3(1.86, 0.09, 0.06), _xf(Vector3(0, 0.80, -2.815), zero))
+	_bake_box(s_front, Vector3(0.34, 0.12, 0.06), _xf(Vector3(-0.72, 0.60, -2.815), zero))
+	_bake_box(s_front, Vector3(0.34, 0.12, 0.06), _xf(Vector3(0.72, 0.60, -2.815), zero))
+	var front_light := MeshInstance3D.new()
+	front_light.mesh = _merged_mesh([s_front], [front_mat])
 	front_light.name = "HeadlightBar"
 	body.add_child(front_light)
-	# Rear light bar: taller, brighter, proud of the tailgate so it
-	# actually reads from the chase camera, plus red corner pods.
-	# Emission is a DEEP red (1.0, 0.0, 0.0) at 0.85 — Round 6:
-	# (1.0,0.02,0.02) @ 1.0 measured orange-red (255,60,36); the G
-	# came from ACES desaturation of the bright red plus the warm
-	# fill light on the 0.35 albedo. Pure-red emission, darker
-	# albedo (0.20) and slightly lower energy push it back toward
-	# deep red without re-blooming it white.
-	var rear_light := _box(Vector3(1.9, 0.16, 0.05), Vector3(0, 0.86, 2.335), _std(Color(0.20, 0.0, 0.0), 0.0, 0.2, Color(1.0, 0.0, 0.0), 0.85))
+
+	# Rear light bar (taller, proud of the tailgate) + red
+	# wrap-around corner pods on the bed sides, ONE merged mesh in
+	# ONE node (name preserved, 1 draw). Deep-red Round-6 material.
+	var s_rear := _surf_new()
+	_bake_box(s_rear, Vector3(1.90, 0.16, 0.05), _xf(Vector3(0, 0.86, 2.34), zero))
+	_bake_box(s_rear, Vector3(0.03, 0.14, 0.30), _xf(Vector3(-0.99, 0.86, 2.05), zero))
+	_bake_box(s_rear, Vector3(0.03, 0.14, 0.30), _xf(Vector3(0.99, 0.86, 2.05), zero))
+	var rear_light := MeshInstance3D.new()
+	rear_light.mesh = _merged_mesh([s_rear], [tail_mat])
 	rear_light.name = "TaillightBar"
 	body.add_child(rear_light)
-	body.add_child(_box(Vector3(0.16, 0.16, 0.05), Vector3(-0.86, 0.86, 2.335), _std(Color(0.20, 0.0, 0.0), 0.0, 0.2, Color(1.0, 0.0, 0.0), 0.85)))
-	body.add_child(_box(Vector3(0.16, 0.16, 0.05), Vector3(0.86, 0.86, 2.335), _std(Color(0.20, 0.0, 0.0), 0.0, 0.2, Color(1.0, 0.0, 0.0), 0.85)))
-	# Headlight corner pods.
-	body.add_child(_box(Vector3(0.34, 0.12, 0.06), Vector3(-0.72, 0.62, -2.8), _std(Color(1, 1, 1), 0.0, 0.2, Color(1.0, 0.98, 0.9), 3.0)))
-	body.add_child(_box(Vector3(0.34, 0.12, 0.06), Vector3(0.72, 0.62, -2.8), _std(Color(1, 1, 1), 0.0, 0.2, Color(1.0, 0.98, 0.9), 3.0)))
 
 	# Warm underglow: a SMALL soft pool of light under the car, not a
 	# pink rug. Radial-gradient texture (alpha fades to zero at the
@@ -513,6 +857,9 @@ static func build_hero_pickup(paint: Color) -> Node3D:
 	glow.position = Vector3(0, 0.04, 0)
 	glow.name = "Underglow"
 	body.add_child(glow)
+
+	# Hero taillight halo (GATE R3): ONE additive billboard quad.
+	body.add_child(_make_hero_halo())
 
 	# Wheels (siblings of Body — Body rotates for stunts, wheels stay put).
 	# Wider track (x=+-1.02) + bigger wheels (r=0.42) so the wheels
@@ -762,6 +1109,61 @@ static func _make_glow_texture(size: int) -> ImageTexture:
 
 # ------------------------------------------------------- palm tree
 
+# Palm bark texture (FROZEN path, GATE R1 — Lane B owns ALL of
+# assets/; Lane A only loads this path, never writes under assets/).
+const PALM_BARK_PATH := "res://assets/palm_bark_512.jpg"
+static var _frond_tex: ImageTexture = null
+
+static func _make_frond_texture(size: int) -> ImageTexture:
+	# ORIGINAL procedural pinnate frond mask (runtime-generated
+	# Image — no file, no import, no licence risk): central rib +
+	# tapered diagonal leaflets, hard 0/1 alpha for alpha-scissor.
+	# U runs along the leaf (base -> tip), V across it. Mipmaps ON
+	# so distant fronds average toward solid instead of shimmering
+	# (GATE R7f / D8 mip check). Cached globally: textures are never
+	# mutated, so sharing across palms is safe (same pattern as the
+	# glow texture). If this is ever saved as a PNG instead, it must
+	# be marked ORIGINAL in a code comment + SOURCES.md via Lane B.
+	if _frond_tex != null:
+		return _frond_tex
+	var img := Image.create(size, size, false, Image.FORMAT_RGBA8)
+	for y in range(size):
+		for x in range(size):
+			var u: float = (float(x) + 0.5) / float(size)
+			var vv: float = (float(y) + 0.5) / float(size)
+			var v: float = absf(vv - 0.5) * 2.0
+			# Silhouette: narrow stem, full mid-leaf, pointed tip.
+			var env: float = smoothstep(0.0, 0.25, u) * (1.0 - smoothstep(0.70, 1.0, u))
+			if u < 0.03:
+				env = 0.08
+			var alpha: float = 0.0
+			if v <= env:
+				# Central rib, tapering toward the tip.
+				var rib: float = 0.07 + 0.04 * (1.0 - u)
+				if v <= rib:
+					alpha = 1.0
+				else:
+					# Diagonal leaflets, angled toward the tip and
+					# TAPERING to points: wide at the rib, narrow
+					# at the edge (uniform stripes read as a comb).
+					var phase: float = fposmod(u * 11.0 - v * 3.2, 1.0)
+					var leaf_w: float = lerpf(0.72, 0.42, v)
+					if phase < leaf_w:
+						alpha = 1.0
+			img.set_pixel(x, y, Color(1.0, 1.0, 1.0, alpha))
+	img.generate_mipmaps()
+	_frond_tex = ImageTexture.create_from_image(img)
+	return _frond_tex
+
+static func _apply_frond_mask(m: StandardMaterial3D, tex: Texture2D) -> void:
+	# Godot 4 alpha-cut: TRANSPARENCY_ALPHA_SCISSOR (depth writes,
+	# no blending/sorting) + threshold. There is no separate
+	# scissor-mode enum in 4.3.
+	m.albedo_texture = tex
+	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
+	m.alpha_scissor_threshold = 0.45
+	m.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
+
 static func _palm_materials() -> Array:
 	# The 5 palm materials, created ONCE and shared by every palm:
 	# leaf/trunk materials are never mutated (world_builder touches
@@ -771,8 +1173,22 @@ static func _palm_materials() -> Array:
 	# emission lift, and two alternating shades so individual leaves
 	# separate from each other. The third, darker shade is the
 	# under-ring: leaves in shadow under the crown.
+	# Cinematic rebuild: the trunk uses the frozen CC0 bark texture
+	# (Lane B) when present, with a LOUD fallback to the old flat
+	# material when it is missing (palm texture pending Lane B);
+	# the fronds get the procedural alpha-scissor mask above
+	# (alpha_scissor, NOT transparency — depth writes, no sorting).
 	if _palm_trunk_mat == null:
-		_palm_trunk_mat = _std_fresh(Color(0.45, 0.30, 0.17), 0.0, 0.85)
+		var bark: Texture2D = null
+		if ResourceLoader.exists(PALM_BARK_PATH):
+			bark = load(PALM_BARK_PATH) as Texture2D
+		if bark != null:
+			_palm_trunk_mat = _std_fresh(Color(1.0, 1.0, 1.0), 0.0, 0.85)
+			_palm_trunk_mat.albedo_texture = bark
+			_palm_trunk_mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
+		else:
+			push_warning("Lane A palm: palm bark texture missing at " + PALM_BARK_PATH + " (palm texture pending Lane B) - using flat trunk material.")
+			_palm_trunk_mat = _std_fresh(Color(0.45, 0.30, 0.17), 0.0, 0.85)
 		_palm_leaf_mat = _std_fresh(Color(0.07, 0.40, 0.15), 0.0, 0.6, Color(0.05, 0.25, 0.08), 0.15)
 		_palm_leaf_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 		_palm_leaf_mat2 = _std_fresh(Color(0.05, 0.30, 0.11), 0.0, 0.6, Color(0.04, 0.20, 0.06), 0.15)
@@ -780,6 +1196,10 @@ static func _palm_materials() -> Array:
 		_palm_leaf_mat3 = _std_fresh(Color(0.03, 0.18, 0.07), 0.0, 0.7, Color(0.02, 0.12, 0.04), 0.15)
 		_palm_leaf_mat3.cull_mode = BaseMaterial3D.CULL_DISABLED
 		_palm_nut_mat = _std_fresh(Color(0.35, 0.22, 0.1), 0.0, 0.8)
+		var frond_tex := _make_frond_texture(256)
+		_apply_frond_mask(_palm_leaf_mat, frond_tex)
+		_apply_frond_mask(_palm_leaf_mat2, frond_tex)
+		_apply_frond_mask(_palm_leaf_mat3, frond_tex)
 	return [_palm_trunk_mat, _palm_leaf_mat, _palm_leaf_mat2, _palm_leaf_mat3, _palm_nut_mat]
 
 static func build_palm() -> Node3D:

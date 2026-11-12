@@ -70,17 +70,55 @@ static func _quad_mesh(color: Color) -> QuadMesh:
 	q.material = mat
 	return q
 
+## Smoke-only quad: smoke puffs get their OWN size — the shared 0.35 m
+## _quad_mesh above must NEVER change (all other emitters depend on it).
+## Same v2.1.0 fix pattern: TRANSPARENCY_ALPHA + shared radial texture on
+## a per-emitter material, so puffs stay soft and round, never hard squares.
+static func _smoke_quad_mesh(color: Color, size: float) -> QuadMesh:
+	var q := QuadMesh.new()
+	q.size = Vector2(size, size)
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = color
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.albedo_texture = _shared_radial_texture()
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.billboard_mode = BaseMaterial3D.BILLBOARD_ENABLED
+	q.material = mat
+	return q
+
 static func _free_later(p: GPUParticles3D, delay: float) -> void:
 	var t: SceneTreeTimer = p.get_tree().create_timer(delay)
 	t.timeout.connect(p.queue_free)
 
-## Grey tyre smoke at the hero's rear wheels (landing / slam / nitro).
+## White tyre smoke at the hero's rear wheels (landing / slam / nitro).
+## Lane C whitening (GATE R11): near-white, larger soft puffs on their own
+## 0.7 m quad — the reel's smoke is white, not grey. Call sites unchanged.
 static func tyre_smoke(parent: Node, pos: Vector3) -> void:
-	var p: GPUParticles3D = _make(parent, pos, 18, 0.7, 0.8)
-	p.process_material = _material(Vector3(0, 1, 1), 35.0, 2.0, 5.0, Vector3(0, 1.5, 0), 0.25, 0.6, Color(0.75, 0.72, 0.7, 0.55), 2.0)
-	p.draw_pass_1 = _quad_mesh(Color(0.75, 0.72, 0.7, 0.55))
+	var p: GPUParticles3D = _make(parent, pos, 22, 0.9, 0.8)
+	p.process_material = _material(Vector3(0, 1, 1), 35.0, 2.0, 5.0, Vector3(0, 1.5, 0), 0.6, 1.2, Color(0.96, 0.95, 0.94, 0.60), 2.0)
+	p.draw_pass_1 = _smoke_quad_mesh(Color(0.96, 0.95, 0.94, 0.60), 0.7)
 	p.emitting = true
-	_free_later(p, 1.2)
+	_free_later(p, 1.4)
+
+## Big soft WHITE burst blooming behind the hero when a stunt completes
+## (the first moment main can know a stunt happened — see SMOKE_DESIGN.md).
+## Own 1.0 m quad; puffs ~0.8–1.6 m.
+static func stunt_smoke_burst(parent: Node, pos: Vector3) -> void:
+	var p: GPUParticles3D = _make(parent, pos, 28, 1.1, 0.85)
+	p.process_material = _material(Vector3(0, 1, 1), 40.0, 2.0, 5.0, Vector3(0, 1.5, 0), 0.8, 1.6, Color(0.97, 0.96, 0.95, 0.60), 2.0)
+	p.draw_pass_1 = _smoke_quad_mesh(Color(0.97, 0.96, 0.95, 0.60), 1.0)
+	p.emitting = true
+	_free_later(p, 1.6)
+
+## Big soft WHITE burst on nitro activation (one per activation; the
+## activation edge in main._physics_process is the only clean trigger).
+## Own 1.0 m quad; puffs ~0.9–1.7 m, thrown rearward.
+static func boost_smoke_burst(parent: Node, pos: Vector3) -> void:
+	var p: GPUParticles3D = _make(parent, pos, 24, 1.0, 0.9)
+	p.process_material = _material(Vector3(0, 0.35, 1), 45.0, 4.0, 8.0, Vector3(0, 0.8, 0), 0.9, 1.7, Color(0.97, 0.96, 0.95, 0.50), 1.2)
+	p.draw_pass_1 = _smoke_quad_mesh(Color(0.97, 0.96, 0.95, 0.50), 1.0)
+	p.emitting = true
+	_free_later(p, 1.5)
 
 ## Gold/white spark burst — near miss, coin, perfect landing.
 static func spark_burst(parent: Node, pos: Vector3, color: Color = Color(1.0, 0.85, 0.3)) -> void:
