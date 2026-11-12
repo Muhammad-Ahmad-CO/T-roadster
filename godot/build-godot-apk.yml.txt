@@ -4,6 +4,11 @@
 # (platform-tools, android-34, build-tools 34.0.0). No Gradle build is used
 # (gradle_build/use_gradle_build=false in export_presets.cfg) — Godot exports
 # with the prebuilt template APK and the workflow signs it with apksigner.
+# 2026-11-12 fix: use the runner's preinstalled Android SDK instead of
+# android-actions/setup-android@v3 — run #1 failed in 18s at that step:
+# with cmdline-tools 16.0 it tries to install the obsolete 'tools' package
+# ("Failed to find package 'tools'", exit 1). cmdline-tools is installed
+# manually only if the preinstalled SDK lacks it.
 name: Build Godot APK
 
 on:
@@ -30,11 +35,21 @@ jobs:
           java-version: '17'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK packages
+        # GitHub-hosted ubuntu runners ship a preinstalled Android SDK.
         run: |
-          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            echo "cmdline-tools missing, installing manually"
+            mkdir -p "$ANDROID_HOME/cmdline-tools"
+            curl -sL -o /tmp/cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q /tmp/cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
+            mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          fi
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          ls "$ANDROID_HOME/build-tools"
 
       - name: Download Godot 4.3
         run: |
