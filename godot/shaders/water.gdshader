@@ -125,7 +125,13 @@ void fragment() {
 	// the hero-angle corridor is still broad/bright in the
 	// centre-right; blue must dominate more of the hero shot.
 	float path = smoothstep(1.0, 0.0, abs(v_local.x - path_cx) / 9.0);
-	float sparkle = stripes * path * 0.04 * near_fade;
+	// v2.3 GATE §V7 [S12]: sparkle 0.04 -> 0.07 — strengthen the
+	// TIME-based shimmer (the only explicit TIME term in fragment();
+	// glitter itself varies only via vertex waves). Split levers:
+	// sparkle (shader, this line) / glitter_strength (code-side 1.6,
+	// UNTOUCHED) / glitter_sharpness (70, UNTOUCHED). Falsifier:
+	// glint strobing at speed -> cut sparkle FIRST, not glitter.
+	float sparkle = stripes * path * 0.07 * near_fade;
 	col += sunset_color.rgb * (glitter + sparkle);
 	// Shore foam: lapping white bands right at the waterline
 	// (local x -> +76.5 is the shore at world x=-14). The foam

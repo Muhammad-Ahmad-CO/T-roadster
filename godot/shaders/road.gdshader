@@ -24,8 +24,11 @@ void vertex() {
 // measured 197,109,75) because the orange sunset sun lights the albedo,
 // and the albedo was already grey. The fix is a custom light() below:
 // the direct-light diffuse is desaturated toward grey on the asphalt
-// while the specular sun streak keeps its warm colour, and the yellow
-// centre dashes keep their warm light. The near-field checkerboard
+// while the specular sun streak keeps its warm colour, and the white
+// centre dashes keep most of their warm light (v2.3 §V6: dashes are
+// white per the reel — the chroma test in light() now gives them
+// partial desaturation, w≈0.31; renders must check they stay white,
+// not grey/mauve). The near-field checkerboard
 // (old per-cell hash, 240x1600 cells) is replaced by smooth value noise.
 //
 // Cinematic rebuild (GATE R5 Step 2) — Asphalt031 texture: the road
@@ -38,7 +41,7 @@ void vertex() {
 
 uniform vec4 asphalt_color : source_color = vec4(0.10, 0.10, 0.12, 1.0);
 uniform vec4 line_color : source_color = vec4(0.92, 0.90, 0.82, 1.0);
-uniform vec4 center_color : source_color = vec4(0.95, 0.88, 0.72, 1.0);
+uniform vec4 center_color : source_color = vec4(0.95, 0.93, 0.86, 1.0); // v2.3 §V6: pale warm white, ALIGNED with the code-side value in _build_road (the code value overwrites this default; editing this alone does nothing).
 uniform vec4 wear_color : source_color = vec4(0.14, 0.14, 0.16, 1.0);
 uniform vec4 sun_tint : source_color = vec4(1.0, 0.45, 0.55, 1.0);
 uniform float wetness = 0.4;
@@ -206,7 +209,9 @@ void fragment() {
 	lane_line = max(lane_line, smoothstep(0.010, 0.004, abs(across - 0.25)));
 	lane_line = max(lane_line, smoothstep(0.010, 0.004, abs(across - 0.5)));
 	lane_line = max(lane_line, smoothstep(0.010, 0.004, abs(across - 0.75)));
-	// Centre divider is warm white at sunset, others white.
+	// Centre divider is pale warm white at sunset, like the other
+	// dashes (v2.3 §V6: was yellow — the reel has NO yellow centre
+	// line). The centre mix is near-dead and kept intentionally.
 	float centre = smoothstep(0.010, 0.004, abs(across - 0.5));
 	vec3 dash_col = mix(line_color.rgb, center_color.rgb, centre);
 	col = mix(col, dash_col, lane_line * dash_on);
@@ -333,15 +338,17 @@ void fragment() {
 	// bright; the lanes stay grey.
 	float streak_band = 1.0 - smoothstep(0.015, 0.05, abs(across - 0.42));
 	float streak_fade = smoothstep(18.0, -2.0, v_wz) * (1.0 - smoothstep(-160.0, -220.0, v_wz));
-	EMISSION = streak_color.rgb * streak_band * streak_fade * 0.20 * streak_strength;
+	EMISSION = streak_color.rgb * streak_band * streak_fade * 0.26 * streak_strength; // v2.3 §V6 stage 2: 0.20 -> 0.26 — the reel road carries a distinct bright sun-streak reflection (r_034); render-gated, falsifier = painted-line read -> step back to 0.20.
 }
 
 // Custom light (Round 5): the orange sunset sun turned the whole road
 // orange-brown even though the albedo is already grey (0.17) — the
 // warmth is in the LIGHT, so the fix belongs here, not in the albedo.
 // The direct-light diffuse is desaturated toward its own luminance on
-// grey asphalt (the road), while coloured markings keep their warm
-// light (the yellow centre line must stay yellow) and the GGX specular
+// grey asphalt (the road), while coloured markings keep more of their
+// warm light (v2.3 §V6: centre dashes are WHITE, not yellow — the
+// chroma test gives them partial desaturation, w≈0.31, so renders
+// must check they stay white, not grey/mauve) and the GGX specular
 // sun streak keeps the warm light colour. ATTENUATION carries the
 // shadow factor for directional lights, so palm/hero shadows still
 // darken the road exactly as before. NOTE (Round 5 diagnostics): the
@@ -359,8 +366,11 @@ void light() {
 	float NdotL = clamp(dot(NORMAL, LIGHT), 0.0, 1.0);
 	vec3 diffuse = LIGHT_COLOR * NdotL * ATTENUATION / 3.14159265;
 	// Grey asphalt (low albedo chroma) gets the full desaturation;
-	// coloured markings (high chroma, e.g. the yellow centre line)
-	// keep their warm light so the dashes stay yellow, not grey.
+	// coloured markings (high chroma) keep more of their warm light.
+	// v2.3 §V6: white dashes have low chroma (spread ~0.09), so they
+	// get PARTIAL desaturation (w≈0.31) automatically — the centre
+	// mix below is near-dead (two near-identical whites) and is KEPT
+	// intentionally (smallest change).
 	// Cinematic rebuild (GATE R5 Step 2): the chroma test runs on the
 	// SMOOTHED base colour (v_base_col), NOT the textured albedo, so
 	// aggregate grain cannot make w flicker per-texel.

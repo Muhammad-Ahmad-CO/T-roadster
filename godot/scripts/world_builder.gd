@@ -28,7 +28,7 @@ const SEGMENT_COUNT := 12
 const WORLD_SPAN := 240.0
 const RECYCLE_Z := 15.0
 const FAR_Z := -225.0
-const PALM_COUNT := 34
+const PALM_COUNT := 40 # v2.3 GATE §V5: 34 -> 40 (+6 net, the V12 cap; +30 draws). Denser palms where the reel shows them (left ocean side).
 const POLE_SPACING := 40.0
 # Cinematic rebuild (follow-up: near-camera intrusion at the Lane C R8
 # camera, z=20, FOV 64): poles/palms recycle well BEFORE the camera
@@ -43,7 +43,20 @@ const POLE_SPACING := 40.0
 # the camera, and guards are low roadside geometry, not looming.
 const POLE_RECYCLE_Z := -10.0
 const PALM_RECYCLE_Z := -10.0
-const CLOUD_COUNT := 14
+const CLOUD_COUNT := 0
+# v2.3 GATE §V2 [S3]: DEFAULT NO CLOUDS — the motion reference shows
+# NO clouds in the reel in motion, and the flat pink discs were the
+# single most fake element on the phone. Removal mechanism: COUNT=0
+# (the _build_clouds loop no-ops; _clouds stays empty so scroll()'s
+# drift/wrap loop is safe; _apply_palette never touched _clouds).
+# Faint wisps ONLY if the sky reads empty AND the lead approves from
+# a render — not pre-approved; see REPORT.md per-biome decisions.
+# v2.3 GATE §V1: sun disc HEIGHT, staged (33 -> 26 -> 20 -> 15, each
+# render-judged vs the reel). ONE value drives all three position
+# literals in _build_sun (disc + 2 halo quads) — no stale height can
+# survive. Disc radius + sun/fill light directions stay FROZEN.
+# FINAL height is recorded in v23-scratch/lane-b/REPORT.md.
+const SUN_Y := 20.0
 
 var _biome := "coastal"
 var _palette: Dictionary = {}
@@ -60,6 +73,8 @@ var _sun_halo: MeshInstance3D
 var _sun_halo2: MeshInstance3D
 var _sun_halo_mat: StandardMaterial3D
 var _sun_halo2_mat: StandardMaterial3D
+var _sun_streak: MeshInstance3D
+var _sun_streak_mat: StandardMaterial3D
 var _halo_tex: Texture2D
 var _lamp_halo_mat: StandardMaterial3D
 
@@ -181,7 +196,11 @@ static func get_biome_palette(biome: String) -> Dictionary:
 				# (0.90,0.60,0.55 — the PROBED colour) + density
 				# 0.0018 -> 0.0022. The v2.1.0 Round 6 cool/thin fog
 				# is superseded: the reel's horizon haze IS warm.
-				"fog_color": Color(0.90, 0.60, 0.55), "fog_density": 0.0022,
+				# v2.3 §V8: 0.0022 -> 0.0026 (COASTAL-only staged
+				# render; beyond 0.0022 requires one per §V8/S13).
+				# Stronger aerial perspective so skyline crowns melt.
+				# Falsifier: near road/hero wash pink -> step back.
+				"fog_color": Color(0.90, 0.60, 0.55), "fog_density": 0.0026,
 				"ambient_color": Color(0.44, 0.44, 0.48),
 				"ocean_color": Color(0.04, 0.16, 0.42), "road_color": Color(0.30, 0.29, 0.32),
 				# Cinematic rebuild (GATE R4): haze 0.95,0.50,0.42 -> 1.00,0.62,0.50 (feeds the ocean sunset_color + road sun_tint + heat haze via _apply_palette).
@@ -419,7 +438,7 @@ func _build_sun() -> void:
 	# orange base (the old (1,0.38,0.08) clipped R first -> yellow).
 	# Build-time defaults are the COASTAL values; _apply_palette
 	# overwrites them per biome on every biome change (both sites
-	# must agree). Position/radius UNCHANGED.
+	# must agree). Radius UNCHANGED; height is SUN_Y (v2.3 §V1).
 	disc_mat.set_shader_parameter("disc_color", Color(1.0, 0.85, 0.70))
 	disc_mat.set_shader_parameter("energy", 3.0)
 	_sun_disc_mat = disc_mat
@@ -432,7 +451,7 @@ func _build_sun() -> void:
 	disc_mesh.rings = 8
 	disc_mesh.material = disc_mat
 	_sun_disc.mesh = disc_mesh
-	_sun_disc.position = Vector3(-54, 33, -233)
+	_sun_disc.position = Vector3(-54, SUN_Y, -233)
 	add_child(_sun_disc)
 
 	# Cinematic rebuild (GATE R3): the SunGlow Sprite3D is REMOVED
@@ -453,13 +472,29 @@ func _build_sun() -> void:
 	_sun_halo_mat = _halo_material(Color(1.0, 1.0, 1.0, 0.75))
 	_sun_halo = _halo_quad(44.0, _sun_halo_mat)
 	_sun_halo.name = "SunHalo"
-	_sun_halo.position = Vector3(-54, 33, -232.5)
+	_sun_halo.position = Vector3(-54, SUN_Y, -232.5)
 	add_child(_sun_halo)
 	_sun_halo2_mat = _halo_material(Color(1.0, 1.0, 1.0, 0.28))
 	_sun_halo2 = _halo_quad(80.0, _sun_halo2_mat)
 	_sun_halo2.name = "SunHalo2"
-	_sun_halo2.position = Vector3(-54, 33, -232.5)
+	_sun_halo2.position = Vector3(-54, SUN_Y, -232.5)
 	add_child(_sun_halo2)
+
+	# v2.3 GATE §V1 [S2]: ONE horizontal flare streak quad (anamorphic
+	# streak INTERPRETATION of the motion reference's horizontal flare
+	# glow — render-gated, drop falsifier applies: solid bar or horizon
+	# blowout -> narrow/fade/drop). Additive R3 halo pattern via the
+	# SHARED _halo_tex/_halo_material (NOT modified — the billboarded
+	# radial texture stretched wide gives soft horizontal ends; camera
+	# roll = 0 keeps it horizontal). Bounds: 140 m wide x 9 m tall,
+	# centred on the disc, peak alpha 0.22 coastal (rain dims in
+	# _apply_palette). +1 draw. Non-square size needs _halo_quad_rect
+	# (_halo_quad makes SQUARE quads only).
+	_sun_streak_mat = _halo_material(Color(1.0, 1.0, 1.0, 0.22))
+	_sun_streak = _halo_quad_rect(140.0, 9.0, _sun_streak_mat)
+	_sun_streak.name = "SunStreak"
+	_sun_streak.position = Vector3(-54, SUN_Y, -232.5)
+	add_child(_sun_streak)
 
 func _make_radial_texture(size: int, inner: Color, outer: Color) -> ImageTexture:
 	var img := Image.create(size, size, false, Image.FORMAT_RGBA8)
@@ -504,6 +539,18 @@ func _halo_quad(size_m: float, mat: Material) -> MeshInstance3D:
 	var mi := MeshInstance3D.new()
 	var q := QuadMesh.new()
 	q.size = Vector2(size_m, size_m)
+	q.material = mat
+	mi.mesh = q
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	return mi
+
+# v2.3 §V1: non-square halo quad for the horizontal flare streak.
+# Same R3 pattern as _halo_quad (material carries the shared radial
+# texture + additive blend); only the quad size is rectangular.
+func _halo_quad_rect(width_m: float, height_m: float, mat: Material) -> MeshInstance3D:
+	var mi := MeshInstance3D.new()
+	var q := QuadMesh.new()
+	q.size = Vector2(width_m, height_m)
 	q.material = mat
 	mi.mesh = q
 	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
@@ -604,7 +651,7 @@ func _build_road() -> void:
 	_road_mat.shader = road_shader
 	_road_mat.set_shader_parameter("asphalt_color", Color(0.10, 0.10, 0.12))
 	_road_mat.set_shader_parameter("line_color", Color(0.92, 0.9, 0.82))
-	_road_mat.set_shader_parameter("center_color", Color(0.98, 0.78, 0.25))
+	_road_mat.set_shader_parameter("center_color", Color(0.95, 0.93, 0.86)) # v2.3 GATE §V6: pale warm WHITE (was yellow 0.98,0.78,0.25) — the reel uses white dashes, no yellow centre line. EFFECTIVE site (shader default is overwritten).
 	_road_mat.set_shader_parameter("wear_color", Color(0.15, 0.15, 0.17))
 	_road_mat.set_shader_parameter("sun_tint", Color(1.0, 0.45, 0.55))
 	_road_mat.set_shader_parameter("wetness", 0.35)
@@ -749,13 +796,12 @@ func _build_palms() -> void:
 func _place_palm(palm: Node3D, z: float, force_side: int = -1) -> void:
 	# Ocean side gets the taller, wind-bent palms; the land side gets
 	# shorter, fuller ones. Keep clear of the road and guardrails.
-	# Round 7 — more palms, biased to the LAND side (left 0.45, was
-	# 0.55): the right-side ground read as one big empty tan expanse,
-	# and palms are the cheapest way to break it up. Right palms also
-	# range further out (x 9.5..42, was 30) and grow bigger
-	# (0.85..1.35, was 0.7..1.15) so the verge reads as planted
-	# roadside, not desert.
-	var left := _rng.randf() < 0.45
+	# v2.3 GATE §V5: left bias 0.45 -> 0.60 — the reel's palms read
+	# mostly LEFT (ocean side, dark silhouettes). Expected split at
+	# PALM_COUNT 40: ~24 left / ~16 right. Left-strip crowding is a
+	# render check (24 palms over 240 m in a 5 m strip, ~10 m mean
+	# spacing). x-bounds UNCHANGED (no palm in sea/road).
+	var left := _rng.randf() < 0.60
 	# Lane B: initial placement may force a side (1 = sand strip,
 	# 0 = land side); recycling calls pass no side and keep the
 	# random draw above. The x-bounds below are unchanged, so a
@@ -843,6 +889,35 @@ func _build_verge() -> void:
 		block.name = "VergeBlock%d" % i
 		_scroll_root.add_child(block)
 		_verge_nodes.append(block)
+	# v2.3 GATE §V5: 12 low undergrowth tufts (scrub clumps, flattened
+	# spheres on the verge-bush pattern — 1 draw each, within the V12
+	# +12 cap; NOT alpha quads: no new alpha texture, no banding risk).
+	# Sides: 6 on the LEFT sand strip (x -13..-8.5, at palm bases,
+	# clear of the -7.4 guardrail and the -14 waterline) + 6 on the
+	# RIGHT verge (x 8.5..20). Placement + recycle = the verge
+	# mechanism exactly: scroll-root children appended to
+	# _verge_nodes, recycled in scroll() (z > RECYCLE_Z -= WORLD_SPAN).
+	var tuft_mats: Array[StandardMaterial3D] = [
+		_std(Color(0.16, 0.24, 0.12), 0.0, 0.95),
+		_std(Color(0.22, 0.30, 0.16), 0.0, 0.95),
+	]
+	for i in range(12):
+		var tuft := MeshInstance3D.new()
+		tuft.name = "Tuft%d" % i
+		var tr := _rng.randf_range(0.3, 0.6)
+		var tm := SphereMesh.new()
+		tm.radius = tr
+		tm.height = tr * 2.0
+		tm.radial_segments = 8
+		tm.rings = 4
+		tm.material = tuft_mats[i % 2]
+		tuft.mesh = tm
+		tuft.scale = Vector3(1.0, _rng.randf_range(0.35, 0.5), 1.0)
+		var tx := _rng.randf_range(-13.0, -8.5) if i < 6 else _rng.randf_range(8.5, 20.0)
+		tuft.position = Vector3(tx, 0.1, FAR_Z + _rng.randf() * WORLD_SPAN)
+		tuft.rotation = Vector3(0, _rng.randf() * TAU, 0)
+		_scroll_root.add_child(tuft)
+		_verge_nodes.append(tuft)
 
 func _build_skyline() -> void:
 	# A city at dusk: dark silhouettes, far away, windows that vary —
@@ -870,7 +945,12 @@ func _build_skyline() -> void:
 	var tower_i := 0
 	while x < 95.0:
 		var w := _rng.randf_range(8.0, 16.0)
-		var h := _rng.randf_range(9.0, 24.0)
+		# v2.3 §V8: heights 9-24 -> 8-27 m (wider RNG spread = more
+		# varied roofline; landmarks unchanged 34-42 m). Silhouette
+		# albedo stays (0.08,0.06,0.15) near-black — NO darkening
+		# (stated decision: already near-black; the melt comes from
+		# fog/ribbon, not a darker albedo).
+		var h := _rng.randf_range(8.0, 27.0)
 		var d := _rng.randf_range(8.0, 12.0)
 		var tz := -252.0 + _rng.randf_range(-18.0, 18.0)
 		# Two landmark towers — clearly taller, stepped tops — so the
@@ -884,14 +964,17 @@ func _build_skyline() -> void:
 			# Stepped crown: a smaller box on top, plus a red beacon.
 			_skyline.add_child(_box(Vector3(w * 0.55, 3.5, d * 0.55), Vector3(x + w * 0.5, h + 1.75 - 1.0, tz), _skyline_mat))
 			_skyline.add_child(_box(Vector3(0.5, 0.5, 0.5), Vector3(x + w * 0.5, h + 3.75 - 1.0, tz), _beacon_mat))
-		# Window clusters at several floors: 2-4 small panes per tower,
-		# each randomly lit or dark, at random heights and x offsets.
-		var clusters := _rng.randi_range(2, 4)
+		# Window clusters at several floors: 3-5 small panes per tower
+		# (v2.3 §V8: was 2-4; +1/tower ≈ +8 draws, within the V12 +24
+		# cap), each randomly lit or dark, at random heights and x
+		# offsets. Lit probability 0.70 (was 0.55) — MORE lit windows,
+		# emissive warm, at zero extra draw cost per lit pane.
+		var clusters := _rng.randi_range(3, 5)
 		for c in range(clusters):
 			var cw := w * _rng.randf_range(0.12, 0.22)
 			var cy := _rng.randf_range(2.0, h - 2.0)
 			var cx := x + w * 0.5 + _rng.randf_range(-w * 0.3, w * 0.3)
-			var lit := _rng.randf() < 0.55
+			var lit := _rng.randf() < 0.70
 			var wm := _window_mat if lit else _window_dark_mat
 			_skyline.add_child(_box(Vector3(cw, 0.55, 0.12), Vector3(cx, cy, tz + d * 0.5 + 0.07), wm))
 		# Rooftop details: AC boxes (dark silhouette bumps) and, on
@@ -1270,6 +1353,7 @@ func _apply_palette() -> void:
 	var sun_tint := Color(1.0, 1.0, 1.0)
 	var sun_alpha := 0.75
 	var sun2_alpha := 0.28
+	var streak_alpha := 0.22
 	var lamp_tint := Color(1.0, 0.95, 0.85, 0.5)
 	match _biome:
 		"neon":
@@ -1282,6 +1366,7 @@ func _apply_palette() -> void:
 			sun_tint = Color(1.0, 0.85, 0.8)
 			sun_alpha = 0.45
 			sun2_alpha = 0.16
+			streak_alpha = 0.12
 			lamp_tint = Color(1.0, 0.9, 0.85, 0.35)
 		"canyon":
 			sun_tint = Color(1.0, 0.9, 0.75)
@@ -1289,6 +1374,7 @@ func _apply_palette() -> void:
 			sun_tint = Color(1.0, 0.95, 0.85)
 	_sun_halo_mat.albedo_color = Color(sun_tint.r, sun_tint.g, sun_tint.b, sun_alpha)
 	_sun_halo2_mat.albedo_color = Color(sun_tint.r, sun_tint.g, sun_tint.b, sun2_alpha)
+	_sun_streak_mat.albedo_color = Color(sun_tint.r, sun_tint.g, sun_tint.b, streak_alpha)
 	_lamp_halo_mat.albedo_color = lamp_tint
 	_environment.ambient_light_color = p["ambient_color"]
 	_environment.fog_light_color = p["fog_color"]
@@ -1379,6 +1465,11 @@ func _apply_palette() -> void:
 		_road_mat.set_shader_parameter("wetness", 0.85)
 	elif _biome == "snow":
 		_road_mat.set_shader_parameter("wetness", 0.4)
+	elif _biome == "coastal":
+		# v2.3 §V6 stage 2: coastal 0.35 -> 0.45 — stronger wet-band
+		# GGX for the reel's wet reflective road (r_034). Render-gated;
+		# falsifier = plastic/glossy road -> step back to 0.35.
+		_road_mat.set_shader_parameter("wetness", 0.45)
 	else:
 		_road_mat.set_shader_parameter("wetness", 0.35)
 	# Round 5 — rain's wet road mirrored the pink sky hardest on the

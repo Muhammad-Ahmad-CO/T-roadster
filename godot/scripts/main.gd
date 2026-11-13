@@ -31,11 +31,23 @@ const INTRO_AUTO_FLIP_DELAY := 0.15
 # Chase camera (Lane C, GATE R8): single source of truth for ALL camera
 # sites (_build_camera, start_run snap, _physics_process). Change values
 # HERE only — a site edited alone silently reverts or jumps framing.
-# Nitro preserves the +8 kick over the base FOV.
+# Nitro preserves the +12 kick over the base FOV.
 const CAM_FOV_BASE := 64.0
-const CAM_FOV_NITRO := 72.0
+const CAM_FOV_NITRO := 76.0
 const CAM_LOOK_Y := 1.2
 const CAM_LOOK_Z := -12.0
+# Lane C v2.3 (GATE §V9/S14): grade-overlay CanvasLayer. HUD = 10, menus =
+# 20 — the overlay sits below both and above the 3D scene.
+const GRADE_LAYER := 5
+# Lane C v2.3 (GATE §V10/S15, Candidate B): Body-rotation poll thresholds,
+# probe-validated (candb5): idle is exactly 0.0, the first stunt sample is
+# 0.15-0.19 rad, the sweep reaches -TAU and resets to 0 on every exit.
+const TRAIL_START_ROT := 0.12
+const TRAIL_STOP_ROT := 0.06
+# Lane C v2.3 (GATE §V13/S18): speed-streak alpha mapping over _speed.
+const STREAK_SPEED_MIN := 34.0
+const STREAK_SPEED_MAX := 52.0
+const STREAK_ALPHA_MAX := 0.28
 
 var state: int = State.MENU
 
@@ -60,6 +72,11 @@ var _distance: float = 0.0
 var _speed: float = 0.0
 var _trauma: float = 0.0
 var _nitro_was_active: bool = false # Lane C smoke hook: nitro activation edge
+var _grade_layer: CanvasLayer = null # Lane C v2.3: grade + streak overlay layer
+var _grade_rect: TextureRect = null # Lane C v2.3: always-on vignette grade
+var _streak_rect: TextureRect = null # Lane C v2.3: speed-gated radial streaks
+var _trail: GPUParticles3D = null # Lane C v2.3: looping stunt trail emitter
+var _trail_on: bool = false # Lane C v2.3: trail poll state (Candidate B)
 var _cam_base_pos := Vector3(0, 4.2, 20.0)
 var _cam_x: float = 0.0 # damped camera x-follow; snapped to the hero in start_run/_to_menu
 var _shake_time: float = 0.0
@@ -92,6 +109,7 @@ func _ready() -> void:
 	_build_camera()
 	_build_gameplay()
 	_build_ui()
+	_build_grade_overlay()
 	_wire_signals()
 	# Menu backdrop is always coastal (the hero biome); each run picks
 	# its own biome in start_run. _to_menu() re-forces coastal on entry.
@@ -260,6 +278,100 @@ func _build_ui() -> void:
 	menus.audio = audio
 	add_child(menus)
 
+func _build_grade_overlay() -> void:
+	# Lane C v2.3 (GATE §V9/S14 + §V13/S18): ONE CanvasLayer holding the
+	# cinematic grade rect (always on) and the speed-streak rect (visible
+	# only at speed). Built purely in code — main.tscn holds only Main +
+	# script. Layer GRADE_LAYER (5): below HUD (10) and menus (20), above
+	# the 3D scene. Every rect has mouse_filter IGNORE: the overlay must
+	# never block HUD input (BOOST/FLIP/ROLL/HOP stay tappable). No
+	# shader file, no Environment change, glow stays OFF.
+	# Fill-rate cost (stated, §V9): the grade rect covers 100% of the
+	# screen every frame at low alpha; the streak rect adds a second
+	# full-screen pass ONLY while visible (visible=false at zero alpha,
+	# so it draws nothing at low speed). Draws: grade +1 always,
+	# streak +1 only when visible.
+	_grade_layer = CanvasLayer.new()
+	_grade_layer.name = "GradeOverlay"
+	_grade_layer.layer = GRADE_LAYER
+	add_child(_grade_layer)
+	_grade_rect = TextureRect.new()
+	_grade_rect.name = "GradeRect"
+	_grade_rect.texture = _make_grade_texture()
+	_grade_rect.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_grade_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	_grade_rect.stretch_mode = TextureRect.STRETCH_SCALE
+	_grade_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_grade_layer.add_child(_grade_rect)
+	_streak_rect = TextureRect.new()
+	_streak_rect.name = "SpeedStreakRect"
+	_streak_rect.texture = _make_streak_texture()
+	_streak_rect.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_streak_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	_streak_rect.stretch_mode = TextureRect.STRETCH_SCALE
+	_streak_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_streak_rect.visible = false
+	_streak_rect.modulate = Color(1.0, 0.96, 0.88, 0.0)
+	_grade_layer.add_child(_streak_rect)
+
+func _make_grade_texture() -> ImageTexture:
+	# Local runtime texture (no shared helper exists for Lane C; no shader
+	# file). 256x256 smooth gradient: a faint warm centre tint fading into
+	# a dark plum vignette at the edges. One smoothstep drives colour +
+	# alpha so the transition stays smooth. ORIGINAL, generated in code.
+	var size := 256
+	var img := Image.create(size, size, false, Image.FORMAT_RGBA8)
+	var half := float(size) * 0.5
+	var warm := Color(1.0, 0.85, 0.65)
+	var dark := Color(0.10, 0.05, 0.10)
+	for y in range(size):
+		for x in range(size):
+			var nx: float = (float(x) + 0.5 - half) / half
+			var ny: float = (float(y) + 0.5 - half) / half
+			var d: float = sqrt(nx * nx + ny * ny)
+			var t: float = smoothstep(0.62, 1.30, d)
+			var col: Color = warm.lerp(dark, t)
+			var a: float = lerpf(0.05, 0.32, t)
+			img.set_pixel(x, y, Color(col.r, col.g, col.b, a))
+	return ImageTexture.create_from_image(img)
+
+func _make_streak_texture() -> ImageTexture:
+	# Local runtime texture: irregular radial spokes from the centre,
+	# fading in with radius (clear centre, streaky edges). Deterministic
+	# sector hash — no RNG state. Texture alpha carries pattern x edge
+	# falloff x sky mask; runtime modulate.a carries the speed mapping.
+	# SKY MASK (render-gated, grade1): unmasked spokes read as a static
+	# sunburst in the sky. Streaks fade out above the horizon band and
+	# stay full on the road/edges, where they read as speed. ORIGINAL,
+	# generated in code.
+	var size := 256
+	var img := Image.create(size, size, false, Image.FORMAT_RGBA8)
+	var half := float(size) * 0.5
+	var sectors := 96
+	var vals: Array = []
+	for i in range(sectors):
+		vals.append(fposmod(sin(float(i) * 12.9898) * 43758.5453, 1.0))
+	for y in range(size):
+		for x in range(size):
+			var nx: float = (float(x) + 0.5 - half) / half
+			var ny: float = (float(y) + 0.5 - half) / half
+			# Screen-space angle (aspect-corrected) so spokes stay
+			# straight on the 1080x1920 portrait rect.
+			var sx: float = nx * 0.5625
+			var ang: float = atan2(ny, sx)
+			var d: float = sqrt(sx * sx + ny * ny)
+			var pos: float = (ang + PI) / TAU * float(sectors)
+			var i0: int = int(floor(pos)) % sectors
+			var i1: int = (i0 + 1) % sectors
+			var f: float = pos - floor(pos)
+			var fs: float = f * f * (3.0 - 2.0 * f)
+			var v: float = lerpf(float(vals[i0]), float(vals[i1]), fs)
+			var streak: float = smoothstep(0.66, 0.94, v)
+			var edge: float = smoothstep(0.22, 0.95, d)
+			var sky: float = smoothstep(-0.5, 0.0, ny)
+			img.set_pixel(x, y, Color(1.0, 0.96, 0.88, streak * edge * sky))
+	return ImageTexture.create_from_image(img)
+
 func _wire_signals() -> void:
 	# Player (single scoring path for hero events).
 	player.stunt_completed.connect(_on_stunt_completed)
@@ -385,6 +497,8 @@ func start_run() -> void:
 	_police_active = false
 	_police_survival_acc = 0.0
 	_trauma = 0.0
+	_stop_stunt_trail() # Lane C v2.3: no trail survives a restart.
+	_hide_streak() # Lane C v2.3: streak re-fades in with speed.
 	_fly_hold_time = 0.0
 	_tilt_calib = Input.get_accelerometer().x
 	Engine.time_scale = 1.0
@@ -432,6 +546,8 @@ func _to_menu() -> void:
 	if _exhaust != null:
 		Particles.stop_exhaust(_exhaust)
 		_exhaust = null
+	_stop_stunt_trail() # Lane C v2.3: trail stops on menu entry.
+	_hide_streak() # Lane C v2.3: streak is run-only.
 	hud.set_in_game(false)
 	hud.hide_countdown()
 	hud.hide_test_site_banner()
@@ -446,7 +562,9 @@ func _on_pause_pressed() -> void:
 		state = State.PAUSED
 		player.active = false
 		audio.stop_engine()
-		menus.show_pause()
+		_stop_stunt_trail() # Lane C v2.3: rotation freezes mid-sweep; the
+		_hide_streak() # PLAYING-only poll cannot stop the trail, so the
+		menus.show_pause() # transition must. Resume re-polls.
 	elif state == State.PAUSED:
 		_on_resume_pressed()
 
@@ -641,6 +759,11 @@ func _physics_process(delta: float) -> void:
 	if player.nitro_active and not _nitro_was_active:
 		Particles.boost_smoke_burst(_particles_root, player.position + Vector3(0, 0.35, 1.8))
 	_nitro_was_active = player.nitro_active
+	# Lane C v2.3 (§V10 Candidate B + §V13): poll the hero Body rotation
+	# for the continuous stunt trail + update the speed streak. Both are
+	# visual-only; neither touches camera values (frozen).
+	_poll_stunt_trail()
+	_update_speed_streak()
 	_trauma = maxf(0.0, _trauma - delta * 1.6)
 	var shake_scale: float = 0.25 if menus.reduce_shake else 1.0
 	var sh: float = _trauma * _trauma * 0.4 * shake_scale
@@ -653,6 +776,62 @@ func _physics_process(delta: float) -> void:
 	_cam_x = lerpf(_cam_x, player.position.x, 1.0 - exp(-5.5 * delta))
 	_camera.position = Vector3(_cam_x, _cam_base_pos.y + player.position.y * 0.3, _cam_base_pos.z) + off
 	_camera.look_at(Vector3(_cam_x, CAM_LOOK_Y + player.position.y * 0.3, CAM_LOOK_Z), Vector3.UP)
+
+# ------------------------------------------------------------------- Lane C v2.3: stunt trail + speed streak
+
+func _hero_body() -> Node3D:
+	# Public scene-tree scan: the first live (non-queued) Node3D child of
+	# the player that has a "Body" child. The hero ROOT name is UNSTABLE:
+	# set_paint rebuilds the hero while the old one is still queued for
+	# deletion, so Godot auto-renames the new root (observed @Node3D@267);
+	# a fixed "HeroPickup/Body" path only resolves at menu. The Body child
+	# name is stable. Returns null if no hero body exists (never fatal).
+	for c in player.get_children():
+		if c is Node3D and not c.is_queued_for_deletion():
+			var b := c.get_node_or_null("Body") as Node3D
+			if b != null:
+				return b
+	return null
+
+func _poll_stunt_trail() -> void:
+	# Candidate B (GATE §V10/S15, probe candb5): during a stunt the hero
+	# Body rotation sweeps 0 -> -TAU on one axis and resets to ZERO on
+	# every exit; lean lives on the player root and squash on Body scale,
+	# so neither confuses this poll. Runs only in PLAYING (the
+	# _physics_process guard); pause/menu/crash stops live in the state
+	# transitions below. No private player state is read.
+	var body := _hero_body()
+	var s := 0.0
+	if body != null:
+		var r: Vector3 = body.rotation
+		s = maxf(absf(r.x), absf(r.z))
+	if not _trail_on and s > TRAIL_START_ROT:
+		_trail = Particles.attach_stunt_trail(player)
+		_trail_on = true
+	elif _trail_on and s < TRAIL_STOP_ROT:
+		_stop_stunt_trail()
+
+func _stop_stunt_trail() -> void:
+	if _trail != null:
+		Particles.stop_stunt_trail(_trail)
+		_trail = null
+	_trail_on = false
+
+func _update_speed_streak() -> void:
+	if _streak_rect == null:
+		return
+	# Alpha mapping (§V13, recorded): 0 below STREAK_SPEED_MIN, ramping
+	# to STREAK_ALPHA_MAX at STREAK_SPEED_MAX (max base speed; nitro
+	# overshoots and clamps). visible=false at zero alpha: a zero-alpha
+	# rect still draws.
+	var t: float = clampf((_speed - STREAK_SPEED_MIN) / (STREAK_SPEED_MAX - STREAK_SPEED_MIN), 0.0, 1.0)
+	_streak_rect.visible = t > 0.0
+	_streak_rect.modulate = Color(1.0, 0.96, 0.88, t * STREAK_ALPHA_MAX)
+
+func _hide_streak() -> void:
+	if _streak_rect != null:
+		_streak_rect.visible = false
+		_streak_rect.modulate = Color(1.0, 0.96, 0.88, 0.0)
 
 # ------------------------------------------------------------------- scoring events
 
@@ -818,6 +997,8 @@ func _on_collision() -> void:
 	if _exhaust != null:
 		Particles.stop_exhaust(_exhaust)
 		_exhaust = null
+	_stop_stunt_trail() # Lane C v2.3: crash stops the trail even if the
+	_hide_streak() # rotation froze mid-sweep (traffic crash mid-stunt).
 	Particles.smash_debris(_particles_root, player.position + Vector3(0, 1.0, 0))
 	# Save immediately on crash (SPEC §9): bests, coins, runs, quests.
 	_crash_stats = scoring.end_run()

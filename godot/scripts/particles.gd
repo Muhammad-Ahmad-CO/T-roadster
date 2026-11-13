@@ -187,6 +187,46 @@ static func stop_exhaust(p: GPUParticles3D) -> void:
 		p.emitting = false
 		_free_later(p, 0.8)
 
+## Looping stunt smoke trail (v2.3 Lane C, GATE §V10 Candidate B).
+## Attached to the hero ROOT while a stunt is active (main polls the Body
+## rotation; see main.gd _poll_stunt_trail) and stopped on every stunt
+## exit. Looping pattern follows attach_exhaust: local_coords=false so
+## puffs stay in world space and stream behind the hero toward the camera.
+## CAP (§V12, lead iteration round 1): amount = 30 live puffs max, ONE draw
+## call per emitter. Own 2.0 m smoke quad (scale 1.25-2.15 -> puffs
+## 2.5-4.3 m); the shared 0.35 m _quad_mesh is untouched. Radial texture + TRANSPARENCY_ALPHA,
+## exactly the v2.1.0 fix pattern — never hard squares.
+static func attach_stunt_trail(parent: Node3D) -> GPUParticles3D:
+	var p := GPUParticles3D.new()
+	p.amount = 30
+	p.lifetime = 1.05
+	p.preprocess = 0.0
+	p.explosiveness = 0.0
+	p.local_coords = false
+	p.position = Vector3(0, 0.5, 2.2)
+	p.visibility_aabb = AABB(Vector3(-6, -3, -6), Vector3(12, 8, 14))
+	var m := ParticleProcessMaterial.new()
+	m.direction = Vector3(0, 0.35, 1)
+	m.spread = 26.0
+	m.initial_velocity_min = 5.0
+	m.initial_velocity_max = 8.0
+	m.gravity = Vector3(0, 0.3, 0)
+	m.damping_min = 1.2
+	m.damping_max = 1.2
+	m.scale_min = 1.25
+	m.scale_max = 2.15
+	m.color = Color(0.97, 0.96, 0.95, 0.85)
+	p.process_material = m
+	p.draw_pass_1 = _smoke_quad_mesh(Color(0.97, 0.96, 0.95, 0.70), 2.0)
+	parent.add_child(p)
+	p.emitting = true
+	return p
+
+static func stop_stunt_trail(p: GPUParticles3D) -> void:
+	if p != null and is_instance_valid(p):
+		p.emitting = false
+		_free_later(p, 1.2)
+
 ## Orange/red debris + smoke — Rocket smash and crash.
 static func smash_debris(parent: Node, pos: Vector3) -> void:
 	var p: GPUParticles3D = _make(parent, pos, 40, 0.9, 1.0)
